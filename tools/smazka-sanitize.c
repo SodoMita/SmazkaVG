@@ -115,7 +115,7 @@ int main(int argc, char **argv) {
     FILE *in = fopen(argv[1], "r");
     if (!in) { fprintf(stderr, "sanitize: cannot open %s\n", argv[1]); return 1; }
     FILE *out = stdout;
-    if (argc == 3) {
+    if (argc == 3 && strcmp(argv[2], "-") != 0) {
         out = fopen(argv[2], "w");
         if (!out) { fprintf(stderr, "sanitize: cannot write %s\n", argv[2]); return 1; }
     }
