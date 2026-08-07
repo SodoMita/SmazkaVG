@@ -128,7 +128,7 @@ static int parse_into(Document *doc, const char *path, LineBuf *rest, int *nwarn
                 if (id < 0 || id >= MAX_PRIMS) break;
                 if (id >= doc->prims.n_strokes) doc->prims.n_strokes = id + 1;
                 doc->prims.strokes[id].edge_id = eid;
-                const char *t = p; for (int i = 0; i < 4; i++) skip_tok(&t);
+                const char *t = p; for (int i = 0; i < 3; i++) skip_tok(&t);
                 double ws[64]; int nw = 0;
                 while (*t && *t != '#' && nw < 64) {
                     if (strncmp(t, "cap=", 4) == 0) break;
@@ -148,7 +148,7 @@ static int parse_into(Document *doc, const char *path, LineBuf *rest, int *nwarn
             if (id < 0 || id >= MAX_PRIMS) break;
             if (id >= doc->prims.n_nodes) doc->prims.n_nodes = id + 1;
             double tx=0, ty=0, rot=0, sx=1, sy=1, skew=0; int cref = 0;
-            const char *t = p; for (int i = 0; i < 2; i++) skip_tok(&t);
+            const char *t = p; for (int i = 0; i < 1; i++) skip_tok(&t);
             if (*t && strchr(t, '=')) {
                 while (*t) {
                     while (*t == ' ') t++;
@@ -189,6 +189,42 @@ static int parse_into(Document *doc, const char *path, LineBuf *rest, int *nwarn
                 if (sscanf(p, "%*d bound_check %d %3s %lf %lf", &pr, dimc, &lo, &hi) == 4) {
                     Constraint *cc = add_con(doc, SEC_ASSERT, A_BOUND_CHECK);
                     if (cc) { cc->u.bound_check.prim = pr; cc->u.bound_check.dim = (dimc[0] == 'y'); cc->u.bound_check.lo = to_q16(lo); cc->u.bound_check.hi = to_q16(hi); }
+                }
+            } else if (strcmp(k, "state_machine") == 0) {
+                /* a <id> state_machine <state_id> <initial> <target> <time|event|condition> <param> [start=..] ... */
+                Constraint *cc = add_con(doc, SEC_ASSERT, A_STATE_MACHINE);
+                if (cc) {
+                    const char *t = p;
+                    for (int i = 0; i < 2; i++) skip_tok(&t);
+                    int sid, initial;
+                    if (sscanf(t, "%d %d", &sid, &initial) == 2) {
+                        cc->u.state_machine.state_id = sid;
+                        cc->u.state_machine.initial = initial;
+                        for (int i = 0; i < 2; i++) skip_tok(&t);
+                        int ntr = 0;
+                        cc->u.state_machine.trans = (Transition *)calloc(MAX_TRANS, sizeof(Transition));
+                        while (*t && *t != '#' && ntr < MAX_TRANS) {
+                            while (*t == ' ' || *t == '\t') t++;
+                            if (!*t || *t == '#') break;
+                            int target, n1, n2, n3; char trig[16]; double param;
+                            if (sscanf(t, "%d%n %15s%n %lf%n", &target, &n1, trig, &n2, &param, &n3) != 3) break;
+                            t += n3;
+                            Transition *tr = &cc->u.state_machine.trans[ntr];
+                            tr->target = (uint16_t)target;
+                            tr->param = to_q16(param);
+                            if (strcmp(trig, "time") == 0) tr->trigger_type = 0;
+                            else if (strcmp(trig, "event") == 0) tr->trigger_type = 1;
+                            else if (strcmp(trig, "condition") == 0) tr->trigger_type = 2;
+                            else break;
+                            while (*t == ' ' || *t == '\t') t++;
+                            if (strncmp(t, "start=", 6) == 0) {
+                                double st2; int ns;
+                                if (sscanf(t + 6, "%lf%n", &st2, &ns) == 1) { tr->start_frame = to_q16(st2); t += 6 + ns; }
+                            }
+                            ntr++;
+                        }
+                        cc->u.state_machine.n_transitions = ntr;
+                    }
                 }
             }
             lb_add(rest, ln);
@@ -248,6 +284,32 @@ static int parse_into(Document *doc, const char *path, LineBuf *rest, int *nwarn
             lb_add(rest, ln);
             break;
         }
+        case 'k': {   /* keyframe: k <id> <node> <time> [st=..] [tx=..] [ty=..] [rot=..] [sx=..] [sy=..] [skew=..] */
+            int id, node; double t;
+            if (sscanf(p, "%d %d %lf", &id, &node, &t) < 3) break;
+            if (node < 0 || node >= MAX_PRIMS || doc->n_keyframes >= MAX_KF) break;
+            Keyframe *kf = &doc->keyframes[doc->n_keyframes];
+            memset(kf, 0, sizeof(*kf));
+            kf->node = node; kf->t = to_q16(t); kf->st = -1;
+            const char *kt = p;
+            for (int i = 0; i < 3; i++) skip_tok(&kt);
+            while (*kt) {
+                while (*kt == ' ' || *kt == '\t') kt++;
+                if (!*kt) break;
+                double v; int n;
+                if (strncmp(kt, "st=", 3) == 0 && sscanf(kt + 3, "%d%n", &kf->st, &n) == 1) { kt += 3 + n; }
+                else if (strncmp(kt, "tx=", 3) == 0 && sscanf(kt + 3, "%lf%n", &v, &n) == 1) { kf->v[0] = to_q16(v); kf->mask |= KF_TX; kt += 3 + n; }
+                else if (strncmp(kt, "ty=", 3) == 0 && sscanf(kt + 3, "%lf%n", &v, &n) == 1) { kf->v[1] = to_q16(v); kf->mask |= KF_TY; kt += 3 + n; }
+                else if (strncmp(kt, "rot=", 4) == 0 && sscanf(kt + 4, "%lf%n", &v, &n) == 1) { kf->v[2] = to_q16(v); kf->mask |= KF_ROT; kt += 4 + n; }
+                else if (strncmp(kt, "sx=", 3) == 0 && sscanf(kt + 3, "%lf%n", &v, &n) == 1) { kf->v[3] = to_q16(v); kf->mask |= KF_SX; kt += 3 + n; }
+                else if (strncmp(kt, "sy=", 3) == 0 && sscanf(kt + 3, "%lf%n", &v, &n) == 1) { kf->v[4] = to_q16(v); kf->mask |= KF_SY; kt += 3 + n; }
+                else if (strncmp(kt, "skew=", 5) == 0 && sscanf(kt + 5, "%lf%n", &v, &n) == 1) { kf->v[5] = to_q16(v); kf->mask |= KF_SKEW; kt += 5 + n; }
+                else skip_tok(&kt);
+            }
+            doc->n_keyframes++;
+            lb_add(rest, ln);
+            break;
+        }
         default:
             lb_add(rest, ln);   /* preserve unknown records verbatim */
             break;
@@ -259,14 +321,30 @@ static int parse_into(Document *doc, const char *path, LineBuf *rest, int *nwarn
 }
 
 /* ─── Document → Line-ASM (vertices with resolved positions) ─────── */
-static void emit_doc(Document *doc, LineBuf *rest, FILE *out) {
+static void emit_doc(Document *doc, LineBuf *rest, FILE *out, int bake_anim) {
     fprintf(out, "# SmazkaVG resolved by smazka-solve\n");
     for (int v = 0; v < doc->prims.n_vertices; v++) {
         fprintf(out, "v %d %.6f %.6f\n", v,
                 from_q16(doc->prims.vertices[v].x),
                 from_q16(doc->prims.vertices[v].y));
     }
-    for (int i = 0; i < rest->n; i++) fputs(rest->lines[i], out);
+    if (bake_anim) {
+        for (int n = 0; n < doc->prims.n_nodes; n++) {
+            Node *nd = &doc->prims.nodes[n];
+            fprintf(out, "n %d tx=%.6f ty=%.6f rot=%.6f sx=%.6f sy=%.6f skew=%.6f content=%d\n",
+                    n, from_q16(nd->tx), from_q16(nd->ty), from_q16(nd->rot),
+                    from_q16(nd->sx), from_q16(nd->sy), from_q16(nd->skew), nd->content_ref);
+        }
+    }
+    for (int i = 0; i < rest->n; i++) {
+        if (bake_anim) {
+            char c = rest->lines[i][0];
+            if (c == 'n' || c == 'k') continue;
+            const char *s = rest->lines[i];
+            if (c == 'a' && strstr(s, "state_machine")) continue;
+        }
+        fputs(rest->lines[i], out);
+    }
 }
 
 int main(int argc, char **argv) {
@@ -274,10 +352,22 @@ int main(int argc, char **argv) {
         fprintf(stderr, "SmazkaVG solve tool\nUsage: %s <in.smazka> [out.smazka]\n", argv[0]);
         return 1;
     }
+    if (argc < 2) {
+        fprintf(stderr, "SmazkaVG solve tool\nUsage: %s <in.smazka> [out.smazka] [--t <seconds>]\n", argv[0]);
+        return 1;
+    }
     Document doc;
     memset(&doc, 0, sizeof(doc));
     doc.config.max_iter = MAX_ITER_DEFAULT;
     doc.config.max_ms = 200;
+
+    double bake_t = -1.0;
+    const char *outp = NULL;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--t") == 0 && i + 1 < argc) { bake_t = atof(argv[i + 1]); i++; }
+        else if (outp == NULL && argv[i][0] != '-') outp = argv[i];
+        else fprintf(stderr, "solve: ignoring unknown option '%s'\n", argv[i]);
+    }
 
     LineBuf rest;
     memset(&rest, 0, sizeof(rest));
@@ -288,12 +378,17 @@ int main(int argc, char **argv) {
             doc.prims.n_vertices, doc.config.n_constraints, w & 0x7FFFFFFF,
             (w & 0x80000000) ? " (timeout)" : "");
 
-    FILE *out = stdout;
-    if (argc >= 3) {
-        out = fopen(argv[2], "w");
-        if (!out) { fprintf(stderr, "solve: cannot write %s\n", argv[2]); return 1; }
+    if (bake_t >= 0) {
+        smazka_resolve_anim(&doc, bake_t, 1);
+        fprintf(stderr, "solve: baked animation pose at t = %.3f s\n", bake_t);
     }
-    emit_doc(&doc, &rest, out);
+
+    FILE *out = stdout;
+    if (outp) {
+        out = fopen(outp, "w");
+        if (!out) { fprintf(stderr, "solve: cannot write %s\n", outp); return 1; }
+    }
+    emit_doc(&doc, &rest, out, bake_t >= 0);
     if (out != stdout) fclose(out);
 
     /* free strokes' width arrays */

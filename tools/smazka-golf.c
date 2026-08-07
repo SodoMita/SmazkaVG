@@ -281,8 +281,8 @@ int main(int argc, char **argv) {
                     t += nread;
                 } else break;
             }
-        } else if (cmd == 'K') {   /* keyframe: K <node> <time> <tx> <ty> <rot> [sx] [sy] [skew] */
-            int node; double t, vals[6] = {0,0,0,1,1,0};
+        } else if (cmd == 'K') {   /* keyframe: K <node> <time> [st=<n>] <tx> <ty> <rot> [sx] [sy] [skew] */
+            int node, st = -1; double t, vals[6] = {0,0,0,1,1,0};
             char *tkn = p;
             int got = 0;
             if (sscanf(tkn, "%d %lf", &node, &t) != 2) { fprintf(stderr, "golf: K needs node time\n"); continue; }
@@ -290,13 +290,15 @@ int main(int argc, char **argv) {
             while (*tkn == ' ' || *tkn == '\t') tkn++;
             while (*tkn && *tkn != ' ' && *tkn != '\t') tkn++;
             while (*tkn == ' ' || *tkn == '\t') tkn++;
+            if (strncmp(tkn, "st=", 3) == 0) { int ns; if (sscanf(tkn + 3, "%d%n", &st, &ns) == 1) tkn += 3 + ns; while (*tkn == ' ' || *tkn == '\t') tkn++; }
             while (*tkn && got < 6) {
                 double v; int n;
                 if (sscanf(tkn, "%lf%n", &v, &n) == 1 && n > 0) { vals[got++] = v; tkn += n; while (*tkn == ' ' || *tkn == '\t') tkn++; }
                 else break;
             }
             if (got < 3) { fprintf(stderr, "golf: K needs tx ty rot\n"); continue; }
-            emit("k %d %d %.4f %.4f %.4f %.4f", nkf++, node, t, vals[0], vals[1], vals[2]);
+            if (st >= 0) emit("k %d %d %.4f st=%d %.4f %.4f %.4f", nkf++, node, t, st, vals[0], vals[1], vals[2]);
+            else emit("k %d %d %.4f %.4f %.4f %.4f", nkf++, node, t, vals[0], vals[1], vals[2]);
             if (got >= 4) emit(" %.4f", vals[3]);
             if (got >= 5) emit(" %.4f", vals[4]);
             if (got >= 6) emit(" %.4f", vals[5]);

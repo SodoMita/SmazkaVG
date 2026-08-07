@@ -123,9 +123,31 @@ static int n_kf;
 static struct {
     int node;          /* target node id */
     double t;          /* time in seconds */
+    int st;            /* state group (-1 = global timeline) */
     int mask;          /* which fields are set */
     double v[6];       /* tx, ty, rot, sx, sy, skew */
 } kf[MAX_KF];
+
+/* ─── State machines (combined animation) ───
+   `a state_machine` records are parsed here and their per-frame activations
+   become BLEND WEIGHTS over keyframe pose groups (`k ... st=<state>`):
+   at frame time t the node pose is
+       Σ_s w_s(t) · pose_s      (renormalized over the states that define it)
+   with fields not covered by any state pose falling back to the global
+   keyframe timeline.  This combines the resolver's state-machine model with
+   the renderer's keyframe timelines: the state machine DRIVES which poses
+   are active, the keyframes DEFINE the poses.  Time triggers use seconds,
+   matching keyframe times. */
+#define MAX_SM 8
+#define MAX_SM_TR 64
+#define MAX_SM_STATES 64
+typedef struct {
+    int initial;                     /* initial state id */
+    int n_tr;
+    struct { int target; int trigger; double param; double start; int event_active; } tr[MAX_SM_TR];
+} StateMachine;
+static StateMachine sm[MAX_SM];
+static int n_sm;
 
 /* arcs */
 static int n_arc;
@@ -330,6 +352,40 @@ static int parse(const char *path) {
                     if (n_acon >= MAX_CON) { warn("line %d: too many 'a' records (max %d)\n", lineno, MAX_CON); break; }
                     acon[n_acon].t = 0; acon[n_acon].a = a; acon[n_acon].b = b; acon[n_acon].c = c; n_acon++;
                 }
+            } else if (strcmp(at, "state_machine") == 0) {
+                /* a <id> state_machine <state_id> <initial> <target> <time|event|condition> <param> [start] ... */
+                if (n_sm >= MAX_SM) { warn("line %d: too many state machines (max %d)\n", lineno, MAX_SM); break; }
+                StateMachine *m = &sm[n_sm];
+                memset(m, 0, sizeof(*m));
+                const char *t = p;
+                for (int i = 0; i < 3; i++) skip_token(&t);   /* cmd, id, "state_machine" */
+                int sid, initial;
+                if (sscanf(t, "%d %d", &sid, &initial) != 2) break;
+                (void)sid;
+                m->initial = initial;
+                for (int i = 0; i < 2; i++) skip_token(&t);   /* state_id, initial */
+                while (*t && *t != '#' && m->n_tr < MAX_SM_TR) {
+                    while (*t == ' ' || *t == '\t') t++;
+                    if (!*t || *t == '#') break;
+                    int target, n1, n2, n3; char trig[16]; double param;
+                    if (sscanf(t, "%d%n %15s%n %lf%n", &target, &n1, trig, &n2, &param, &n3) != 3) break;
+                    t += n3;
+                    m->tr[m->n_tr].target = target;
+                    m->tr[m->n_tr].param = param;
+                    m->tr[m->n_tr].start = 0;
+                    m->tr[m->n_tr].event_active = 0;
+                    if (strcmp(trig, "time") == 0) m->tr[m->n_tr].trigger = 0;
+                    else if (strcmp(trig, "event") == 0) m->tr[m->n_tr].trigger = 1;
+                    else if (strcmp(trig, "condition") == 0) m->tr[m->n_tr].trigger = 2;
+                    else { warn("line %d: state_machine: unknown trigger '%s'\n", lineno, trig); break; }
+                    while (*t == ' ' || *t == '\t') t++;
+                    if (strncmp(t, "start=", 6) == 0) {       /* optional labeled start */
+                        double st2; int ns;
+                        if (sscanf(t + 6, "%lf%n", &st2, &ns) == 1) { m->tr[m->n_tr].start = st2; t += 6 + ns; }
+                    }
+                    m->n_tr++;
+                }
+                n_sm++;
             }
             break;
         }
@@ -431,6 +487,7 @@ static int parse(const char *path) {
             if (n_kf >= MAX_KF) { warn("line %d: too many keyframes (max %d)\n", lineno, MAX_KF); break; }
             kf[n_kf].node = node;
             kf[n_kf].t = t;
+            kf[n_kf].st = -1;
             kf[n_kf].mask = 0;
             const char *kt = p;
             for (int i = 0; i < 3; i++) skip_token(&kt);
@@ -439,7 +496,8 @@ static int parse(const char *path) {
                     while (*kt == ' ' || *kt == '\t') kt++;
                     if (!*kt) break;
                     double v; int n;
-                    if (strncmp(kt, "tx=", 3) == 0 && sscanf(kt + 3, "%lf%n", &v, &n) == 1) { kf[n_kf].v[0] = v; kf[n_kf].mask |= KF_TX; kt += 3 + n; }
+                    if (strncmp(kt, "st=", 3) == 0 && sscanf(kt + 3, "%d%n", &kf[n_kf].st, &n) == 1) { kt += 3 + n; }
+                    else if (strncmp(kt, "tx=", 3) == 0 && sscanf(kt + 3, "%lf%n", &v, &n) == 1) { kf[n_kf].v[0] = v; kf[n_kf].mask |= KF_TX; kt += 3 + n; }
                     else if (strncmp(kt, "ty=", 3) == 0 && sscanf(kt + 3, "%lf%n", &v, &n) == 1) { kf[n_kf].v[1] = v; kf[n_kf].mask |= KF_TY; kt += 3 + n; }
                     else if (strncmp(kt, "rot=", 4) == 0 && sscanf(kt + 4, "%lf%n", &v, &n) == 1) { kf[n_kf].v[2] = v; kf[n_kf].mask |= KF_ROT; kt += 4 + n; }
                     else if (strncmp(kt, "sx=", 3) == 0 && sscanf(kt + 3, "%lf%n", &v, &n) == 1) { kf[n_kf].v[3] = v; kf[n_kf].mask |= KF_SX; kt += 3 + n; }
@@ -664,6 +722,7 @@ static int kf_field(double t, int node, int field, double *out) {
     int fi = kf_fi(field);
     for (int i = 0; i < n_kf; i++) {
         int idx = kf_order[i];
+        if (kf[idx].st != -1) continue;               /* state poses are not on the global timeline */
         if (kf[idx].node != node || !(kf[idx].mask & field)) continue;
         if (kf[idx].t <= t && (lo_t < 0 || kf[idx].t > kf[lo_t].t)) { lo_t = idx; }
         if (kf[idx].t >= t && (hi_t < 0 || kf[idx].t < kf[hi_t].t)) { hi_t = idx; }
@@ -678,8 +737,78 @@ static int kf_field(double t, int node, int field, double *out) {
     return 1;
 }
 
-/* Evaluate all keyframes at time t (seconds) and bake node transforms.
-   Call after anim_restore_base(). */
+/* state-pose value: the value of `field` for `node` in pose group `st`
+   (last keyframe wins within the group).  Returns 0 if not defined. */
+static int state_pose_value(int st, int node, int field, double *out) {
+    int fi = kf_fi(field);
+    int found = -1;
+    for (int i = 0; i < n_kf; i++) {
+        if (kf[i].st != st || kf[i].node != node || !(kf[i].mask & field)) continue;
+        if (found < 0 || kf[i].t > kf[found].t) found = i;
+    }
+    if (found < 0) return 0;
+    *out = kf[found].v[fi];
+    return 1;
+}
+
+/* Exclusive-chain state machine weights at time t, keyed by GLOBAL state id
+   (the `st=` values).  Transitions are processed in file order and form a
+   chain: the initial state's weight decays as transitions progress, and a
+   later transition fades out the earlier ones, so idle->walk->jump blends
+   cleanly instead of saturating at 50/50 (the resolver's activation model
+   keeps the initial state permanently active; the renderer's chain model is
+   the animation semantics — see SPEC §5.3.1/§4.9).  Multiple machines
+   accumulate (each machine's weights are normalized, then the union is
+   blended). */
+static double g_sm_event_input;
+static int g_sm_event_target = -1;
+static void sm_weights(double t, double w[MAX_SM_STATES]) {
+    for (int s = 0; s < MAX_SM_STATES; s++) w[s] = 0.0;
+    for (int m = 0; m < n_sm; m++) {
+        StateMachine *M = &sm[m];
+        int n = M->n_tr;
+        double a[MAX_SM_TR];
+        for (int i = 0; i < n; i++) {
+            switch (M->tr[i].trigger) {
+            case 0: {   /* time ramp over `param` seconds starting at `start` */
+                double dur = M->tr[i].param > 1.0 ? M->tr[i].param : 1.0;
+                a[i] = (t - M->tr[i].start) / dur;
+                if (a[i] < 0) a[i] = 0;
+                if (a[i] > 1) a[i] = 1;
+                break;
+            }
+            case 1: a[i] = M->tr[i].event_active ? 1.0 : 0.0; break;
+            case 2: a[i] = (g_sm_event_input >= M->tr[i].param) ? 1.0 : 0.0; break;
+            default: a[i] = 0.0; break;
+            }
+        }
+        double act[MAX_SM_STATES] = {0};
+        if (M->initial >= 0 && M->initial < MAX_SM_STATES) {
+            double base = 1.0;
+            for (int i = 0; i < n; i++) base -= a[i];
+            if (base < 0) base = 0;
+            act[M->initial] = base;
+        }
+        for (int i = 0; i < n; i++) {
+            if (M->tr[i].target < 0 || M->tr[i].target >= MAX_SM_STATES) continue;
+            double e = a[i];
+            for (int j = i + 1; j < n; j++) e *= (1.0 - a[j]);   /* later transitions fade earlier */
+            act[M->tr[i].target] = e;
+        }
+        /* normalize this machine's weights, accumulate into the union */
+        double sum = 0;
+        for (int s = 0; s < MAX_SM_STATES; s++) sum += act[s];
+        if (sum < 1e-12) { if (M->initial >= 0 && M->initial < MAX_SM_STATES) act[M->initial] = 1.0, sum = 1.0; }
+        if (sum > 1e-12) for (int s = 0; s < MAX_SM_STATES; s++) w[s] += act[s] / sum;
+    }
+}
+
+/* Evaluate keyframes and state machines at time t (seconds) and bake node
+   transforms.  Call after anim_restore_base().  When state machines exist,
+   the node pose is the weighted blend of the active states' keyframe poses
+   (renormalized over the states that define each field); fields with no
+   state poses fall back to the global keyframe timeline, then to the node's
+   base values. */
 static void apply_anim(double t, int loop) {
     if (n_kf == 0) { apply_node_transforms(); return; }
     if (!kf_sorted) {
@@ -691,18 +820,48 @@ static void apply_anim(double t, int loop) {
     if (loop) {
         double tmax = 0;
         for (int i = 0; i < n_kf; i++) if (kf[i].t > tmax) tmax = kf[i].t;
+        for (int m = 0; m < n_sm; m++)
+            for (int i = 0; i < sm[m].n_tr; i++)
+                if (sm[m].tr[i].start + sm[m].tr[i].param > tmax) tmax = sm[m].tr[i].start + sm[m].tr[i].param;
         if (tmax > 0) { t = fmod(t, tmax); if (t < 0) t += tmax; }
     }
-    /* nodes[] currently holds the base pose; overwrite animated fields */
+    if (g_sm_event_target >= 0) {        /* apply --event: activate transitions to that state */
+        for (int m = 0; m < n_sm; m++)
+            for (int i = 0; i < sm[m].n_tr; i++)
+                if (sm[m].tr[i].target == g_sm_event_target) sm[m].tr[i].event_active = 1;
+    }
 
+    double w[MAX_SM_STATES];
+    int has_sm = n_sm > 0;
+    if (has_sm) sm_weights(t, w);
+
+    /* nodes[] currently holds the base pose; overwrite animated fields */
+    static const int fields[6] = { KF_TX, KF_TY, KF_ROT, KF_SX, KF_SY, KF_SKEW };
     for (int i = 0; i < n_n; i++) {
-        double v;
-        if (kf_field(t, i, KF_TX, &v)) nodes[i].tx = v;
-        if (kf_field(t, i, KF_TY, &v)) nodes[i].ty = v;
-        if (kf_field(t, i, KF_ROT, &v)) nodes[i].rot = v;
-        if (kf_field(t, i, KF_SX, &v)) nodes[i].sx = v;
-        if (kf_field(t, i, KF_SY, &v)) nodes[i].sy = v;
-        if (kf_field(t, i, KF_SKEW, &v)) nodes[i].skew = v;
+        for (int f = 0; f < 6; f++) {
+            double v;
+            if (has_sm) {
+                /* blended state pose: renormalize over the states that define it */
+                double val = 0, wsum = 0;
+                for (int s = 0; s < MAX_SM_STATES; s++) {
+                    if (w[s] <= 1e-9) continue;
+                    double pv;
+                    if (state_pose_value(s, i, fields[f], &pv)) { val += w[s] * pv; wsum += w[s]; }
+                }
+                if (wsum > 1e-9) { v = val / wsum; goto set_field; }
+            }
+            /* fallback: global timeline, else base */
+            if (!kf_field(t, i, fields[f], &v)) continue;
+        set_field:
+            switch (f) {
+            case 0: nodes[i].tx = v; break;
+            case 1: nodes[i].ty = v; break;
+            case 2: nodes[i].rot = v; break;
+            case 3: nodes[i].sx = v; break;
+            case 4: nodes[i].sy = v; break;
+            default: nodes[i].skew = v; break;
+            }
+        }
     }
     apply_node_transforms();
 }
@@ -1932,7 +2091,9 @@ int main(int argc, char **argv) {
                         "  --anim <fps> <frames>   render a frame sequence (PNG+BMP per frame, +GIF if PIL present)\n"
                         "  --t <seconds>           render a single frame at time t\n"
                         "  --out <prefix>          output prefix for the frame sequence\n"
-                        "  --loop                  wrap time modulo the animation duration\n", argv[0]);
+                        "  --loop                  wrap time modulo the animation duration\n"
+                        "  --event <state>         activate event triggers targeting that state\n"
+                        "  --input <value>         value for condition triggers\n", argv[0]);
         return 1;
     }
     const char *inp = argv[1];
@@ -1949,6 +2110,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--t") == 0 && i + 1 < argc) { t_single = atof(argv[i + 1]); i += 1; }
         else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) { snprintf(out_prefix, sizeof(out_prefix), "%s", argv[i + 1]); i += 1; }
         else if (strcmp(argv[i], "--loop") == 0) { loop = 1; }
+        else if (strcmp(argv[i], "--event") == 0 && i + 1 < argc) { g_sm_event_target = atoi(argv[i + 1]); i += 1; }
+        else if (strcmp(argv[i], "--input") == 0 && i + 1 < argc) { g_sm_event_input = atof(argv[i + 1]); i += 1; }
         else fprintf(stderr, "smazka: ignoring unknown option '%s'\n", argv[i]);
     }
     if (w < 64) w = 64;
@@ -1969,8 +2132,8 @@ int main(int argc, char **argv) {
         else if (edges[i].type == E_RATIONAL) nr++;
         else if (edges[i].type == E_CATMULL) nm++;
     }
-    fprintf(stderr, "v1.5: %d verts, %d edges (seg:%d quad:%d cubic:%d rat:%d cat:%d), %d faces, %d strokes, %d arcs, %d ellipses, %d keyframes, %d warnings\n",
-            n_v, n_e, n_e - nq - nc - nr - nm, nq, nc, nr, nm, n_f, n_s, n_arc, n_ell, n_kf, n_warn);
+    fprintf(stderr, "v1.5: %d verts, %d edges (seg:%d quad:%d cubic:%d rat:%d cat:%d), %d faces, %d strokes, %d arcs, %d ellipses, %d keyframes, %d state machines, %d warnings\n",
+            n_v, n_e, n_e - nq - nc - nr - nm, nq, nc, nr, nm, n_f, n_s, n_arc, n_ell, n_kf, n_sm, n_warn);
 
     char base[512]; strip_ext(inp, base, sizeof(base));
     crc_init();

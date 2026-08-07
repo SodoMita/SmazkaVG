@@ -157,9 +157,26 @@ typedef struct {
 } SolverConfig;
 
 typedef struct {
+    int node;          /* target node id */
+    q16_t t;           /* time in seconds (Q16.16); state poses use it as "last wins" */
+    int st;            /* state group (-1 = global timeline) */
+    uint16_t mask;     /* which fields are set */
+    q16_t v[6];        /* tx, ty, rot, sx, sy, skew */
+} Keyframe;
+#define MAX_KF 512
+#define KF_TX 1
+#define KF_TY 2
+#define KF_ROT 4
+#define KF_SX 8
+#define KF_SY 16
+#define KF_SKEW 32
+
+typedef struct {
     PrimitiveStore prims;
     SolverConfig config;
     Clock clock;
+    Keyframe keyframes[MAX_KF];
+    int n_keyframes;
 } Document;
 
 /* ─── Timing ─────────────────────────────────────────────────────── */
@@ -296,6 +313,20 @@ static void resolve_edge_connects(Document *doc, int *warnings) {
  * and normalised to weights (Σw = 1).  v1.1 used the constant vector
  * w_i = 1/n, making every animation a static average — fixed here.
  */
+/*
+ * State machines: exclusive-chain weights over states (SPEC §4.9 / §5.3.1).
+ * States are 0..n_transitions (state 0 = initial, transition i drives
+ * state i+1).  Each trigger activates:
+ *   0 time      -> ramp (t - start)/param clamped to [0,1]   (seconds)
+ *   1 event     -> event_active ? 1 : 0
+ *   2 condition -> (clock.input >= param) ? 1 : 0
+ * The initial state's weight decays as transitions progress
+ * (base = max(0, 1 - Σ a_i)) and a later transition fades earlier ones
+ * (e_i = a_i · Π_{j>i} (1 - a_j)), so idle->walk->jump blends cleanly
+ * instead of saturating at 50/50.  The v1.1 code assigned the constant
+ * vector w_i = 1/n to every state, making every animation a static
+ * average — fixed in v1.3.1 and refined here.
+ */
 static void resolve_state_machines(Document *doc, int *warnings) {
     for (int i = 0; i < doc->config.n_constraints; i++) {
         Constraint *c = &doc->config.constraints[i];
@@ -304,46 +335,48 @@ static void resolve_state_machines(Document *doc, int *warnings) {
         int n_states = c->u.state_machine.n_transitions + 1;
         if (n_states < 1 || n_states > MAX_STATES) { warn_(warnings, "state_machine: bad state count"); continue; }
         if (c->u.state_machine.n_transitions > MAX_TRANS) { warn_(warnings, "state_machine: too many transitions"); continue; }
-
-        double *act = (double *)calloc((size_t)n_states, sizeof(double));
-        if (!act) { warn_(warnings, "state_machine: allocation failed"); continue; }
-
-        int init = c->u.state_machine.initial;
-        if (init < 0 || init >= n_states) init = 0;
-        act[init] = 1.0;
-
         if (c->u.state_machine.n_transitions > 0 && !c->u.state_machine.trans) {
-            warn_(warnings, "state_machine: missing transition array");
-            free(act); continue;
+            warn_(warnings, "state_machine: missing transition array"); continue;
         }
-        double frame = doc->clock.frame;
-        for (int t = 0; t < c->u.state_machine.n_transitions; t++) {
-            Transition *tr = &c->u.state_machine.trans[t];
-            if (tr->target >= n_states) { warn_(warnings, "state_machine: bad transition target"); continue; }
-            double a = 0.0;
+
+        int n = c->u.state_machine.n_transitions;
+        double a[MAX_TRANS];
+        double t = doc->clock.frame;   /* seconds */
+        for (int k = 0; k < n; k++) {
+            Transition *tr = &c->u.state_machine.trans[k];
             switch (tr->trigger_type) {
             case 0: {
                 double dur = fmax(from_q16(tr->param), 1.0);
-                a = (frame - from_q16(tr->start_frame)) / dur;
-                if (a < 0) a = 0;
-                if (a > 1) a = 1;
+                a[k] = (t - from_q16(tr->start_frame)) / dur;
+                if (a[k] < 0) a[k] = 0;
+                if (a[k] > 1) a[k] = 1;
                 break;
             }
-            case 1: a = tr->event_active ? 1.0 : 0.0; break;
-            case 2: a = (doc->clock.input >= tr->param) ? 1.0 : 0.0; break;
-            default:
-                warn_(warnings, "state_machine: unknown trigger type %u", tr->trigger_type);
-                break;
+            case 1: a[k] = tr->event_active ? 1.0 : 0.0; break;
+            case 2: a[k] = (doc->clock.input >= tr->param) ? 1.0 : 0.0; break;
+            default: a[k] = 0.0; break;
             }
-            act[tr->target] = fmax(act[tr->target], a);
         }
-
-        double sum = 0.0;
+        double *act = (double *)calloc((size_t)n_states, sizeof(double));
+        if (!act) { warn_(warnings, "state_machine: allocation failed"); continue; }
+        int init = c->u.state_machine.initial;
+        if (init < 0 || init >= n_states) init = 0;
+        double base = 1.0;
+        for (int k = 0; k < n; k++) base -= a[k];
+        if (base < 0) base = 0;
+        act[init] = base;
+        for (int k = 0; k < n; k++) {
+            int target = c->u.state_machine.trans[k].target;
+            if (target < 0 || target >= n_states) { warn_(warnings, "state_machine: bad transition target"); continue; }
+            double e = a[k];
+            for (int j = k + 1; j < n; j++) e *= (1.0 - a[j]);
+            act[target] = e;
+        }
+        double sum = 0;
         for (int s = 0; s < n_states; s++) sum += act[s];
         if (sum < 1e-12) { act[init] = 1.0; sum = 1.0; }
         for (int s = 0; s < n_states; s++) act[s] /= sum;
         for (int s = 0; s < n_states; s++) c->u.state_machine.weights[s] = act[s];
-
         free(act);
     }
 }
@@ -948,6 +981,143 @@ static void resolve_qp(Document *doc, int *warnings) {
 #endif /* SMZ_HAVE_PSOLVE */
 
 /* ═══════════════════════════════════════════════════════════════════
+ *  COMBINED ANIMATION — state machine weights drive keyframe pose blending
+ * ═══════════════════════════════════════════════════════════════════ */
+
+static int kf_fi(int field) {
+    int fi = 0;
+    while ((field & 1) == 0) { fi++; field >>= 1; }
+    return fi;
+}
+/* value of `field` for `node` in pose group st (last keyframe wins) */
+static int state_pose_value(const Document *doc, int st, int node, int field, double *out) {
+    int fi = kf_fi(field);
+    int found = -1;
+    for (int i = 0; i < doc->n_keyframes; i++) {
+        const Keyframe *kf = &doc->keyframes[i];
+        if (kf->st != st || kf->node != node || !(kf->mask & field)) continue;
+        if (found < 0 || kf->t > doc->keyframes[found].t) found = i;
+    }
+    if (found < 0) return 0;
+    *out = from_q16(doc->keyframes[found].v[fi]);
+    return 1;
+}
+/* global-timeline interpolation at t (state keyframes excluded) */
+static int kf_field(const Document *doc, double t, int node, int field, double *out) {
+    int fi = kf_fi(field);
+    int lo = -1, hi = -1;
+    for (int i = 0; i < doc->n_keyframes; i++) {
+        const Keyframe *kf = &doc->keyframes[i];
+        if (kf->st != -1 || kf->node != node || !(kf->mask & field)) continue;
+        double kt = from_q16(kf->t);
+        if (kt <= t && (lo < 0 || kt > from_q16(doc->keyframes[lo].t))) lo = i;
+        if (kt >= t && (hi < 0 || kt < from_q16(doc->keyframes[hi].t))) hi = i;
+    }
+    if (lo < 0 && hi < 0) return 0;
+    if (lo < 0) { *out = from_q16(doc->keyframes[hi].v[fi]); return 1; }
+    if (hi < 0) { *out = from_q16(doc->keyframes[lo].v[fi]); return 1; }
+    if (lo == hi) { *out = from_q16(doc->keyframes[lo].v[fi]); return 1; }
+    double t0 = from_q16(doc->keyframes[lo].t), t1 = from_q16(doc->keyframes[hi].t);
+    double f = (t1 > t0) ? (t - t0) / (t1 - t0) : 1.0;
+    double v0 = from_q16(doc->keyframes[lo].v[fi]), v1 = from_q16(doc->keyframes[hi].v[fi]);
+    *out = v0 * (1 - f) + v1 * f;
+    return 1;
+}
+
+/* Combined animation resolve: computes the exclusive-chain state weights at
+   time t and writes the blended keyframe pose (state poses renormalized over
+   the states that define each field, global-timeline fallback) into the
+   nodes' transforms.  Pure math — no psolve.  Returns the number of
+   warnings.  Mirrors the renderer's semantics (SPEC §4.9). */
+int smazka_resolve_anim(Document *doc, double t, int loop) {
+    int warnings = 0;
+    if (doc->n_keyframes == 0) return 0;
+    if (loop) {
+        double tmax = 0;
+        for (int i = 0; i < doc->n_keyframes; i++)
+            if (from_q16(doc->keyframes[i].t) > tmax) tmax = from_q16(doc->keyframes[i].t);
+        for (int i = 0; i < doc->config.n_constraints; i++) {
+            Constraint *c = &doc->config.constraints[i];
+            if (c->section == SEC_ASSERT && c->subtype == A_STATE_MACHINE)
+                for (int k = 0; k < c->u.state_machine.n_transitions; k++) {
+                    double e = from_q16(c->u.state_machine.trans[k].start_frame) + fmax(from_q16(c->u.state_machine.trans[k].param), 1.0);
+                    if (e > tmax) tmax = e;
+                }
+        }
+        if (tmax > 0) { t = fmod(t, tmax); if (t < 0) t += tmax; }
+    }
+
+    /* global state weights (exclusive-chain, all machines) */
+    double w[MAX_STATES];
+    for (int s = 0; s < MAX_STATES; s++) w[s] = 0.0;
+    for (int ci = 0; ci < doc->config.n_constraints; ci++) {
+        Constraint *c = &doc->config.constraints[ci];
+        if (c->section != SEC_ASSERT || c->subtype != A_STATE_MACHINE) continue;
+        int n = c->u.state_machine.n_transitions;
+        double a[MAX_TRANS];
+        for (int k = 0; k < n; k++) {
+            Transition *tr = &c->u.state_machine.trans[k];
+            switch (tr->trigger_type) {
+            case 0: {
+                double dur = fmax(from_q16(tr->param), 1.0);
+                a[k] = (t - from_q16(tr->start_frame)) / dur;
+                if (a[k] < 0) a[k] = 0;
+                if (a[k] > 1) a[k] = 1;
+                break;
+            }
+            case 1: a[k] = tr->event_active ? 1.0 : 0.0; break;
+            case 2: a[k] = (from_q16(doc->clock.input) >= from_q16(tr->param)) ? 1.0 : 0.0; break;
+            default: a[k] = 0.0; break;
+            }
+        }
+        double act[MAX_STATES] = {0};
+        int init = c->u.state_machine.initial;
+        if (init < 0 || init >= MAX_STATES) init = 0;
+        double base = 1.0;
+        for (int k = 0; k < n; k++) base -= a[k];
+        if (base < 0) base = 0;
+        act[init] = base;
+        for (int k = 0; k < n; k++) {
+            int target = c->u.state_machine.trans[k].target;
+            if (target < 0 || target >= MAX_STATES) continue;
+            double e = a[k];
+            for (int j = k + 1; j < n; j++) e *= (1.0 - a[j]);
+            act[target] = e;
+        }
+        double sum = 0;
+        for (int s = 0; s < MAX_STATES; s++) sum += act[s];
+        if (sum > 1e-12) for (int s = 0; s < MAX_STATES; s++) w[s] += act[s] / sum;
+    }
+    int has_sm = 0;
+    for (int ci = 0; ci < doc->config.n_constraints; ci++)
+        if (doc->config.constraints[ci].section == SEC_ASSERT && doc->config.constraints[ci].subtype == A_STATE_MACHINE) has_sm = 1;
+
+    static const int fields[6] = { KF_TX, KF_TY, KF_ROT, KF_SX, KF_SY, KF_SKEW };
+    for (int ni = 0; ni < doc->prims.n_nodes; ni++) {
+        Node *nd = &doc->prims.nodes[ni];
+        double vals[6];
+        vals[0] = from_q16(nd->tx); vals[1] = from_q16(nd->ty); vals[2] = from_q16(nd->rot);
+        vals[3] = from_q16(nd->sx); vals[4] = from_q16(nd->sy); vals[5] = from_q16(nd->skew);
+        for (int f = 0; f < 6; f++) {
+            double v;
+            if (has_sm) {
+                double val = 0, wsum = 0;
+                for (int s = 0; s < MAX_STATES; s++) {
+                    if (w[s] <= 1e-9) continue;
+                    double pv;
+                    if (state_pose_value(doc, s, ni, fields[f], &pv)) { val += w[s] * pv; wsum += w[s]; }
+                }
+                if (wsum > 1e-9) { vals[f] = val / wsum; continue; }
+            }
+            if (kf_field(doc, t, ni, fields[f], &v)) vals[f] = v;
+        }
+        nd->tx = to_q16(vals[0]); nd->ty = to_q16(vals[1]); nd->rot = to_q16(vals[2]);
+        nd->sx = to_q16(vals[3]); nd->sy = to_q16(vals[4]); nd->skew = to_q16(vals[5]);
+    }
+    return warnings;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  *  PHASE 4 — Validation (a): bound checks
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -1075,7 +1245,8 @@ int main(void) {
         doc.clock.frame = 5.0;
         smazka_resolve(&doc);
         double *w = sm->u.state_machine.weights;
-        int w5_ok = fabs(w[0] - 0.5) < 1e-9 && fabs(w[1] - 0.25) < 1e-9 && fabs(w[2] - 0.25) < 1e-9;
+        /* exclusive-chain: base=0, e0=0.25, e1=0.5 -> (0, 1/3, 2/3) */
+        int w5_ok = fabs(w[0]) < 1e-9 && fabs(w[1] - 1.0/3.0) < 1e-9 && fabs(w[2] - 2.0/3.0) < 1e-9;
         int not_uniform = fabs(w[0] - 1.0/3.0) > 1e-6;
         if (w0_ok && w5_ok && not_uniform)
             printf("PASS test3: weights track triggers: frame0=(%.2f,%.2f,%.2f) frame5=(%.2f,%.2f,%.2f)\n",
@@ -1228,6 +1399,40 @@ int main(void) {
         else { printf("FAIL test11: world (%.2f, %.2f, %.2f) errors (%.3f, %.3f, %.3f)\n", w0, w1, w2, e01, e12, e20); failures++; }
     }
 #endif /* SMZ_HAVE_PSOLVE */
+
+    /* ── Test 12: combined animation — state machine blends keyframe poses ── */
+    {
+        memset(&doc, 0, sizeof(doc)); doc.config.max_iter = MAX_ITER_DEFAULT; doc.config.max_ms = 200;
+        doc.prims.n_nodes = 1;
+        /* state machine: initial 0 -> state 1 over 1s */
+        Constraint *smc = add_c(&doc, SEC_ASSERT, A_STATE_MACHINE);
+        smc->u.state_machine.state_id = 0;
+        smc->u.state_machine.initial = 0;
+        smc->u.state_machine.n_transitions = 1;
+        smc->u.state_machine.trans = (Transition *)calloc(1, sizeof(Transition));
+        assert(smc->u.state_machine.trans);
+        smc->u.state_machine.trans[0].target = 1;
+        smc->u.state_machine.trans[0].trigger_type = 0;
+        smc->u.state_machine.trans[0].param = to_q16(1.0);
+        smc->u.state_machine.trans[0].start_frame = 0;
+        /* poses: state 0 tx=0, state 1 tx=160 (node 0) */
+        doc.n_keyframes = 2;
+        doc.keyframes[0].node = 0; doc.keyframes[0].t = 0; doc.keyframes[0].st = 0;
+        doc.keyframes[0].mask = KF_TX; doc.keyframes[0].v[0] = to_q16(0.0);
+        doc.keyframes[1].node = 0; doc.keyframes[1].t = 0; doc.keyframes[1].st = 1;
+        doc.keyframes[1].mask = KF_TX; doc.keyframes[1].v[0] = to_q16(160.0);
+
+        smazka_resolve_anim(&doc, 0.0, 0);
+        double x0 = from_q16(doc.prims.nodes[0].tx);
+        smazka_resolve_anim(&doc, 0.5, 0);
+        double x5 = from_q16(doc.prims.nodes[0].tx);
+        smazka_resolve_anim(&doc, 1.0, 0);
+        double x1 = from_q16(doc.prims.nodes[0].tx);
+        int ok = fabs(x0 - 0.0) < 1e-3 && fabs(x5 - 80.0) < 1e-2 && fabs(x1 - 160.0) < 1e-2;
+        if (ok) printf("PASS test12: combined anim: tx at t=0/0.5/1 = %.2f / %.2f / %.2f\n", x0, x5, x1);
+        else { printf("FAIL test12: tx = %.2f / %.2f / %.2f\n", x0, x5, x1); failures++; }
+        free(smc->u.state_machine.trans);
+    }
 
     if (failures) { printf("%d TEST(S) FAILED\n", failures); return 1; }
     printf("ALL RESOLVER TESTS PASSED\n");

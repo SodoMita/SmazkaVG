@@ -2,7 +2,7 @@
 
 **A flat, binary-first vector graphics format with embedded LP + convex QP constraint solvers.**
 
-> Version 1.5 — Specification, reference rasterizer, resolver, and tooling
+> Version 1.6 — Specification, reference rasterizer, resolver, and tooling
 
 ---
 
@@ -10,7 +10,7 @@
 
 SmazkaVG is a next-generation vector graphics format designed for:
 
-- **Anime/Illustration production** — topology-aware shared edges, Poisson diffusion curves, variable-width strokes with caps/joins, node transforms, hole-aware faces, keyframe animation
+- **Anime/Illustration production** — topology-aware shared edges, Poisson diffusion curves, variable-width strokes with caps/joins, node transforms, hole-aware faces, state-machine-driven keyframe animation
 - **CAD/Web interchange** — deterministic fixed-point arithmetic, compact binary encoding
 - **LLM-friendly editing** — flat Line-ASM textual projection (~50% fewer tokens than JSON/XML)
 - **Code golf / generative art** — a byte-starved dialect compiler (`tools/smazka-golf`)
@@ -53,6 +53,7 @@ SmazkaVG/
 │   ├── donut.smazka                   # Face holes (even-odd fill)
 │   ├── nodes_demo.smazka              # Node transforms
 │   ├── animation_demo.smazka          # Keyframe animation (frame sequence)
+│   ├── statemachine_demo.smazka       # State machine driving keyframe poses
 │   ├── solve_demo.smazka              # smazka-solve constraint demo
 │   └── golf_face.sg / golf_face.smazka# Golf dialect demo
 └── tests/
@@ -83,6 +84,10 @@ make solver-test
 # animation: keyframes drive node transforms -> render a frame sequence
 ./build/smazka-raster examples/animation_demo.smazka 320 240 --anim 12 24 --loop --out anim
 #   -> anim_000.png ... anim_023.png + anim.gif (animated)
+
+# combined: a state machine blends between keyframe poses (idle->walk->jump)
+./build/smazka-raster examples/statemachine_demo.smazka 320 240 --anim 12 24 --loop --out sm
+./build/smazka-solve examples/statemachine_demo.smazka baked.smazka --t 1.5   # bake one frame
 
 # golf dialect: one-token shapes, implicit IDs
 ./build/smazka-golf examples/golf_face.sg face.smazka

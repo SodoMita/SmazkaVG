@@ -1,0 +1,38 @@
+# Combined animation demo (v1.6): a state machine DRIVES which keyframe pose
+# is active, with smooth blending between states.
+#   idle (rest) -> walk (moves right, slight bounce) -> jump (far right, raised)
+# Render:  smazka-raster statemachine_demo.smazka 320 240 --anim 12 24 --loop --out sm
+v 0 0 0
+v 1 36 0
+v 2 36 36
+v 3 0 36
+e 0 0 1
+e 1 1 2
+e 2 2 3
+e 3 3 0
+f 0 0 1 2 3 FF9F43
+s 0 0 8A4B12 3 3
+s 1 1 8A4B12 3 3
+s 2 2 8A4B12 3 3
+s 3 3 8A4B12 3 3
+z 0 90 120 80 80 0 FFF3E0 00000000 0     # static halo
+n 0 content=0
+n 1 content=1
+n 2 content=2
+n 3 content=3
+a 0 state_machine 0 0  1 time 1.0  2 time 1.0 start=1.0
+# state 0 = idle (left, upright)
+k 0 0 0 st=0 tx=0 ty=0
+k 1 1 0 st=0 tx=0 ty=0
+k 2 2 0 st=0 tx=0 ty=0
+k 3 3 0 st=0 tx=0 ty=0
+# state 1 = walk (moves right, small bounce down)
+k 4 0 0 st=1 tx=90 ty=10
+k 5 1 0 st=1 tx=90 ty=10
+k 6 2 0 st=1 tx=90 ty=10
+k 7 3 0 st=1 tx=90 ty=10
+# state 2 = jump (far right, raised)
+k 8 0 0 st=2 tx=180 ty=-70
+k 9 1 0 st=2 tx=180 ty=-70
+k 10 2 0 st=2 tx=180 ty=-70
+k 11 3 0 st=2 tx=180 ty=-70

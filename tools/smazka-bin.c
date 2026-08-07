@@ -270,6 +270,37 @@ static int enc(const char *inp, const char *outp) {
                 if (sscanf(p, "%*d edge_connects %d %d %d", &a, &b, &c) == 3) {
                     fputc(0x21, out); wu(out, (uint32_t)id); wu(out, (uint32_t)a); wu(out, (uint32_t)b); wu(out, (uint32_t)c); counts[9]++;
                 }
+            } else if (strcmp(k, "state_machine") == 0) {
+                const char *t = p; for (int i = 0; i < 2; i++) skip_tok(&t);
+                int sid, initial;
+                if (sscanf(t, "%d %d", &sid, &initial) == 2) {
+                    for (int i = 0; i < 2; i++) skip_tok(&t);
+                    /* tokenize transitions into an array */
+                    struct { int target, trig; double param, start; } tr[128];
+                    int ntr = 0;
+                    const char *u = t;
+                    while (*u && *u != '#' && ntr < 128) {
+                        while (*u == ' ' || *u == '\t') u++;
+                        if (!*u || *u == '#') break;
+                        int target, n1, n2, n3; char trig[16]; double param;
+                        if (sscanf(u, "%d%n %15s%n %lf%n", &target, &n1, trig, &n2, &param, &n3) != 3) break;
+                        u += n3;
+                        tr[ntr].target = target;
+                        tr[ntr].trig = strcmp(trig, "time") == 0 ? 0 : strcmp(trig, "event") == 0 ? 1 : 2;
+                        tr[ntr].param = param;
+                        tr[ntr].start = 0;
+                        while (*u == ' ' || *u == '\t') u++;
+                        if (strncmp(u, "start=", 6) == 0) { int ns; if (sscanf(u + 6, "%lf%n", &tr[ntr].start, &ns) == 1) u += 6 + ns; }
+                        ntr++;
+                    }
+                    fputc(0x23, out); wu(out, (uint32_t)id); wu(out, (uint32_t)sid); wu(out, (uint32_t)initial);
+                    wu(out, (uint32_t)ntr);
+                    for (int i = 0; i < ntr; i++) {
+                        fputc(tr[i].trig, out); wu(out, (uint32_t)tr[i].target);
+                        wq(out, tr[i].param); wq(out, tr[i].start);
+                    }
+                    counts[9]++;
+                }
             }
             break;
         }
@@ -311,6 +342,17 @@ static int enc(const char *inp, const char *outp) {
             }
             fputc(0x09, out); wu(out, (uint32_t)id); wu(out, (uint32_t)node);
             wq(out, t);
+            int st = -1;
+            {
+                const char *kt2 = p;
+                for (int i = 0; i < 3; i++) skip_tok(&kt2);
+                while (*kt2) {
+                    while (*kt2 == ' ' || *kt2 == '\t') kt2++;
+                    if (strncmp(kt2, "st=", 3) == 0) { int ns; if (sscanf(kt2 + 3, "%d%n", &st, &ns) == 1) break; }
+                    else break;
+                }
+            }
+            wz(out, st);
             fputc(mask, out);
             for (int b = 0; b < 6; b++) if (mask & (1 << b)) wq(out, v[b]);
             counts[4]++;   /* keyframes share the node counter slot */
@@ -407,16 +449,29 @@ static void dec(const char *inp, const char *outp) {
             fprintf(out, "\n"); break; }
         case 0x09: { int id = (int)ru(in), node = (int)ru(in);
             double t = rq(in);
+            int st = (int)rz(in);
             int mask = fgetc(in);
             double v[6] = {0,0,0,1,1,0};
             for (int b = 0; b < 6; b++) if (mask & (1 << b)) v[b] = rq(in);
             fprintf(out, "k %d %d %.6f", id, node, t);
+            if (st >= 0) fprintf(out, " st=%d", st);
             if (mask & 1)  fprintf(out, " tx=%.6f", v[0]);
             if (mask & 2)  fprintf(out, " ty=%.6f", v[1]);
             if (mask & 4)  fprintf(out, " rot=%.6f", v[2]);
             if (mask & 8)  fprintf(out, " sx=%.6f", v[3]);
             if (mask & 16) fprintf(out, " sy=%.6f", v[4]);
             if (mask & 32) fprintf(out, " skew=%.6f", v[5]);
+            fprintf(out, "\n"); break; }
+        case 0x23: { int id = (int)ru(in), sid = (int)ru(in), initial = (int)ru(in);
+            int ntr = (int)ru(in);
+            fprintf(out, "a %d state_machine %d %d", id, sid, initial);
+            for (int i = 0; i < ntr; i++) {
+                int trigv = fgetc(in);
+                int target = (int)ru(in);
+                double param = rq(in), start = rq(in);
+                fprintf(out, " %d %s %.6f", target, trigv == 0 ? "time" : trigv == 1 ? "event" : "condition", param);
+                if (start != 0) fprintf(out, " start=%.6f", start);
+            }
             fprintf(out, "\n"); break; }
         case 0x06: { int id = (int)ru(in);
             double tx = rq(in), ty = rq(in), rot = rq(in), sx = rq(in), sy = rq(in), skew = rq(in);

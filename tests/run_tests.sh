@@ -314,6 +314,75 @@ print("  PASS: fill color starting with digits parses (88AA00)")
 EOF
 check "digit-leading fill parses" "[ $? -eq 0 ]"
 
+echo "== combined animation: state machine drives keyframe poses =="
+cat > "$BUILD/t/sm.smazka" <<'EOF'
+v 0 0 0
+v 1 40 0
+v 2 40 40
+v 3 0 40
+e 0 0 1
+e 1 1 2
+e 2 2 3
+e 3 3 0
+f 0 0 1 2 3 66CCFF
+n 0 content=0
+n 1 content=1
+n 2 content=2
+n 3 content=3
+a 0 state_machine 0 0  1 time 1.0
+k 0 0 0 st=0 tx=0
+k 1 0 0 st=1 tx=160
+k 2 1 0 st=0 tx=0
+k 3 1 0 st=1 tx=160
+k 4 2 0 st=0 tx=0
+k 5 2 0 st=1 tx=160
+k 6 3 0 st=0 tx=0
+k 7 3 0 st=1 tx=160
+EOF
+"$BUILD/smazka-raster" "$BUILD/t/sm.smazka" 256 256 --anim 4 5 --out "$BUILD/t/smf" >/dev/null 2>&1
+python3 - "$BUILD/t" <<'EOF'
+import sys
+from PIL import Image
+import numpy as np
+t = sys.argv[1]
+def cx(i):
+    im = np.asarray(Image.open(f"{t}/smf_{i:03d}.png").convert('RGB')).astype(int)
+    fill = (np.abs(im[:,:,0]-0x66)<=8)&(np.abs(im[:,:,1]-0xCC)<=8)&(np.abs(im[:,:,2]-0xFF)<=8)
+    ys,xs = np.where(fill)
+    return xs.mean() if len(xs) else None
+xs = [cx(i) for i in range(5)]
+assert all(x is not None for x in xs)
+steps = [xs[i+1]-xs[i] for i in range(4)]
+assert max(steps)-min(steps) < 3, f"state-machine blend not linear {steps}"
+print("  PASS: state machine blends pose0->pose1 linearly", [round(x,1) for x in xs])
+EOF
+check "state machine drives keyframe pose blending" "[ $? -eq 0 ]"
+
+echo "== combined anim: bake a frame with smazka-solve --t =="
+"$BUILD/smazka-solve" "$BUILD/t/sm.smazka" "$BUILD/t/baked.smazka" --t 0.5 2>/dev/null
+python3 - "$BUILD/t/baked.smazka" <<'EOF'
+import sys, re
+txs = []
+for ln in open(sys.argv[1]):
+    m = re.search(r'n \d+ tx=([\d.-]+)', ln)
+    if m: txs.append(float(m.group(1)))
+assert len(txs) == 4, f"expected 4 baked nodes, got {len(txs)}"
+assert all(abs(t - 80.0) < 0.1 for t in txs), f"baked tx should be 80 at t=0.5, got {txs}"
+assert not any(ln.startswith(('k ', 'a ')) for ln in open(sys.argv[1])), "k/a lines should be stripped"
+print("  PASS: smazka-solve --t 0.5 bakes tx=80 and strips k/a")
+EOF
+check "smazka-solve bakes a combined-animation frame" "[ $? -eq 0 ]"
+
+echo "== combined anim: binary round-trip (st + state_machine) =="
+"$BUILD/smazka-bin" enc "$BUILD/t/sm.smazka" "$BUILD/t/sm.smvg" 2>/dev/null
+"$BUILD/smazka-bin" dec "$BUILD/t/sm.smvg" "$BUILD/t/sm.rt" 2>/dev/null
+o=$(grep -cE '^(a|k) ' "$BUILD/t/sm.smazka"); r=$(grep -cE '^(a|k) ' "$BUILD/t/sm.rt")
+check "state machine + st keyframes round-trip (${o}->${r})" "[ "$o" = "$r" ]"
+grep -q "state_machine 0 0 1 time" "$BUILD/t/sm.rt"
+check "state machine transitions survive round-trip" "[ $? -eq 0 ]"
+grep -q "st=1" "$BUILD/t/sm.rt"
+check "keyframe st groups survive round-trip" "[ $? -eq 0 ]"
+
 echo "== smazka-solve pipeline =="
 make solve > "$BUILD/t/solve-build.log" 2>&1
 check "smazka-solve builds" "[ $? -eq 0 ]"

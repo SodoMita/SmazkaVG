@@ -1,7 +1,7 @@
 # SmazkaVG v1.3 Formal Specification
 
 > Flat Document Model · LP + Convex QP Solver · Fixed-Point Determinism
-> Revision 1.5 — 2026-08-07
+> Revision 1.6 — 2026-08-07
 > Supersedes v1.1 (SMT-era) and v1.2 (namespace split). This revision
 > documents the reference rasterizer (`src/rasterizer.c`) and resolver
 > (`src/resolver.c`) as shipped: psolve LP/QP backend, Poisson diffusion
@@ -50,6 +50,7 @@
 | v1.4 | Diffusion curves are a real discrete Laplace (Poisson) solve (SOR, bounded, deterministic) instead of a signed-distance brush. Stroke caps (round/butt/square; round caps form round joins). Self-contained PNG output. `tools/smazka-solve` applies the resolver to a file end-to-end. Resolver `rig` QP implemented (translation-only equilibrium). |
 | v1.4.1 | **Node transforms applied**: affine transforms (scale→skew→rotate→translate, node ID order) are baked into the vertex store for vertex/edge content. **Face holes**: `f <outer edges> | <hole edges> [| ...] [fill]` filled with even-odd rule (curved holes tessellated). Parser fixes: fill colors starting with decimal digits (e.g. `88AA00`) parse correctly; inline `#` comments no longer leak into the fill. Binary container encodes/decodes holes and 8-digit face fills. Resolver `rig` switched to psolve's **fixed-point PGS** boxed QP (integer-exact Q16.16). |
 | v1.5 | **Animation**: `k` keyframe records drive node transforms; the rasterizer interpolates per field (piecewise-linear, partial keyframes inherit the node's base pose) and renders **frame sequences** (`--anim <fps> <frames> [--loop] [--out prefix]`) with a fixed camera covering the animation's full bounding box; single frames at a time are rendered with `--t <seconds>`. Animated GIF output is assembled from the PNG frames when PIL is available. Keyframes round-trip through the binary container; golf dialect gains `K`. |
+| v1.6 | **State machines drive keyframe poses**: `a state_machine` activations become **blend weights** over keyframe pose groups (`k ... st=<state>`); the renderer computes an exclusive-chain weight model (initial decays as transitions progress, later transitions fade earlier ones, so idle→walk→jump blends cleanly) and blends the active states' poses per node field, with the global keyframe timeline as fallback. Resolver gains `smazka_resolve_anim`; `smazka-solve --t <s>` bakes a frame; binary container round-trips `st=` and state machines; golf `K` accepts `st=`. |
 
 ---
 
@@ -373,15 +374,22 @@ Offset  Size  Field          Description
 0x02    2     id             uint16 global keyframe ID
 0x04    2     node_id        uint16 target node
 0x06    4     time           Q16.16 time in seconds (>= 0)
-0x0A    1     mask           which transform fields are set (bits: 1=tx 2=ty 4=rot 8=sx 16=sy 32=skew)
+0x0A    4     st             zigzag int32 state group (-1 = global timeline)
+0x0E    1     mask           which transform fields are set (bits: 1=tx 2=ty 4=rot 8=sx 16=sy 32=skew)
        4×n   values         Q16.16 values for the set fields, in bit order
 ```
 
 Line-ASM:
 
 ```
-k <id> <node_id> <time> [tx=..] [ty=..] [rot=..] [sx=..] [sy=..] [skew=..]
+k <id> <node_id> <time> [st=<state>] [tx=..] [ty=..] [rot=..] [sx=..] [sy=..] [skew=..]
 ```
+
+A keyframe with `st=<state>` defines that state's **pose** for the listed
+fields (within a state group the last keyframe per node/field wins; `time` is
+only used for ordering). A keyframe without `st=` lives on the **global
+timeline** (piecewise-linear interpolation in `time`). See §5.3.1 for how the
+two interact.
 
 **Semantics.** A keyframe sets a *partial* pose for a node at `time` seconds.
 Each of the six transform fields is animated independently over the keyframes
@@ -452,24 +460,48 @@ LP/QP solver.
 | `0x02` | `bound_check` | `prim_id(u16), dim(u8), lo(Q16.16), hi(Q16.16)` | Clamps a coordinate into `[lo, hi]` (saturating) |
 | `0x03` | `state_machine` | `state_id(u16), initial(u16), transitions[]` | Per-frame animation automaton (§5.3.1) |
 
-#### 5.3.1 state_machine
+#### 5.3.1 state_machine — drives keyframe pose blending (v1.6)
 
-Each machine has states `S_0..S_{n-1}` (where `n = n_transitions + 1`) and
-transitions with triggers. At resolve time the current frame (document clock)
+```
+a <id> state_machine <state_id> <initial> <target> <time|event|condition> <param> [start=<t>] ...
+```
+
+Each machine has an initial state and an ordered list of transitions; each
+transition i drives state `target_i`. At render time the document clock
 evaluates every trigger:
 
-| trigger_type | Activation |
+| trigger_type | Activation `a_i` |
 |---|---|
-| `0` time | ramp `(frame − start_frame) / duration` clamped to `[0,1]` |
-| `1` event | 1 if the event is active, else 0 |
-| `2` condition | 1 if `clock.input ≥ param`, else 0 |
+| `0` time | ramp `(t − start) / param` clamped to `[0,1]` (seconds, matching keyframe times) |
+| `1` event | 1 if the event is active (renderer: `--event <target>`), else 0 |
+| `2` condition | 1 if `input ≥ param` (renderer: `--input <value>`), else 0 |
 
-The initial state carries a base activation of 1.0; activations are max-combined
-and **normalised to weights** `w_i` (Σw = 1). The blended transform is
-`Σ w_i × xform(S_i)`. For fully cyclic machines the steady state is the fixed
-point of the transition matrix, computed by bounded iteration (≤ `MAX_ITER`).
-The v1.1 behavior — a constant uniform blend `w_i = 1/n` that made every
-animation a static average — is **removed**.
+**Exclusive-chain weights.** The initial state's weight decays as transitions
+progress and later transitions fade earlier ones, so idle→walk→jump blends
+cleanly instead of saturating at 50/50:
+
+```
+w_initial = max(0, 1 − Σ_i a_i)
+w_i       = a_i · Π_{j>i} (1 − a_j)
+(normalize to Σw = 1)
+```
+
+**Combined rendering.** When the document has both a state machine and
+keyframes, the state weights become **blend weights over the keyframe pose
+groups** (`k ... st=<state>`). For each node field:
+
+```
+value = ( Σ_{s: w_s > 0 and pose_s defines the field} w_s · pose_s ) / ( Σ over the same states )
+```
+
+— renormalized over the states that define the field. Fields with no state
+pose fall back to the **global keyframe timeline** at `t` (piecewise-linear),
+then to the node's base value. So a state machine selects *which* poses are
+active and the keyframes *define* the poses; a global timeline can animate
+details independently. The resolver exposes the same math as
+`smazka_resolve_anim(doc, t, loop)`, and `smazka-solve --t <s>` bakes a frame
+into a static document. The v1.1 behavior — a constant uniform blend
+`w_i = 1/n` — is **removed**.
 
 ### 5.4 Constraints (c) — LP
 
