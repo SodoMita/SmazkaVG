@@ -1,4 +1,6 @@
+build/
 *.bmp
-*.png
-smazka-raster
-*.o
+*.webp
+*.svg
+*.txt
+work/

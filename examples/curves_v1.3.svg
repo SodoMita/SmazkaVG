@@ -1,22 +1,22 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" width="800" height="500">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
   <!-- SmazkaVG v1.3 SVG projection -->
-  <rect width="800" height="500" fill="white"/>
-  <ellipse cx="351.59" cy="188.33" rx="73.78" ry="36.89" fill="rgba(240,240,255,1.00)" stroke="rgba(51,51,51,1.00)" stroke-width="1.84"/>
-  <path d="M 632.85,353.17 A 96.83,96.83 0 1 1 536.02,256.34" stroke="rgba(136,68,0,1.00)" stroke-width="2.42" fill="none"/>
-  <path id="e0" d="M 167.15,50.00 C 259.37,-5.33 443.80,105.33 536.02,50.00" stroke="#282828" stroke-width="1.5" fill="none"/>
-  <path id="e1" d="M 259.37,142.22 Q 351.59,96.11 351.59,234.44" stroke="#282828" stroke-width="1.5" fill="none"/>
-  <line id="e2" x1="351.59" y1="50.00" x2="443.80" y2="142.22" stroke="#282828" stroke-width="1.5"/>
-  <line id="e3" x1="167.15" y1="50.00" x2="259.37" y2="142.22" stroke="#282828" stroke-width="1.5"/>
-  <line id="e4" x1="259.37" y1="142.22" x2="351.59" y2="234.44" stroke="#282828" stroke-width="1.5"/>
-  <line id="e5" x1="351.59" y1="234.44" x2="536.02" y2="50.00" stroke="#282828" stroke-width="1.5"/>
-  <path id="s0" d="M 167.15,50.00 C 259.37,-5.33 443.80,105.33 536.02,50.00" stroke="rgba(0,0,255,1.00)" stroke-width="2.95" stroke-linecap="round" fill="none"/>
-  <line id="s1" x1="259.37" y1="142.22" x2="351.59" y2="234.44" stroke="rgba(255,0,0,1.00)" stroke-width="2.77" stroke-linecap="round"/>
-  <line id="s2" x1="351.59" y1="50.00" x2="443.80" y2="142.22" stroke="rgba(0,170,0,1.00)" stroke-width="1.84" stroke-linecap="round"/>
-  <circle id="v0" cx="167.15" cy="50.00" r="3" fill="#dc3232" data-type="corner"/>
-  <circle id="v1" cx="351.59" cy="50.00" r="3" fill="#dc3232" data-type="corner"/>
-  <circle id="v2" cx="536.02" cy="50.00" r="3" fill="#dc3232" data-type="corner"/>
-  <circle id="v3" cx="259.37" cy="142.22" r="3" fill="#dc3232" data-type="corner"/>
-  <circle id="v4" cx="443.80" cy="142.22" r="3" fill="#dc3232" data-type="corner"/>
-  <circle id="v5" cx="351.59" cy="234.44" r="3" fill="#dc3232" data-type="corner"/>
+  <rect width="256" height="256" fill="white"/>
+  <ellipse cx="128.00" cy="159.20" rx="31.20" ry="15.60" fill="rgba(240,240,255,1.00)" stroke="rgba(51,51,51,1.00)" stroke-width="0.78"/>
+  <path d="M 109.05,162.03 A 9.13,9.13 0 1 1 99.92,152.90" stroke="rgba(136,68,0,1.00)" stroke-width="0.23" fill="none"/>
+  <path id="e0" d="M 50.00,100.70 C 89.00,77.30 167.00,124.10 206.00,100.70" stroke="#282828" stroke-width="1.5" fill="none"/>
+  <path id="e1" d="M 89.00,139.70 Q 128.00,120.20 128.00,178.70" stroke="#282828" stroke-width="1.5" fill="none"/>
+  <line id="e2" x1="128.00" y1="100.70" x2="167.00" y2="139.70" stroke="#282828" stroke-width="1.5"/>
+  <line id="e3" x1="50.00" y1="100.70" x2="89.00" y2="139.70" stroke="#282828" stroke-width="1.5"/>
+  <line id="e4" x1="89.00" y1="139.70" x2="128.00" y2="178.70" stroke="#282828" stroke-width="1.5"/>
+  <line id="e5" x1="128.00" y1="178.70" x2="206.00" y2="100.70" stroke="#282828" stroke-width="1.5"/>
+  <path id="s0" d="M 50.00,100.70 C 89.00,77.30 167.00,124.10 206.00,100.70" stroke="rgba(0,0,255,1.00)" stroke-width="1.25" stroke-linecap="round" fill="none"/>
+  <path id="s1" d="M 89.00,139.70 Q 128.00,120.20 128.00,178.70" stroke="rgba(255,0,0,1.00)" stroke-width="1.17" stroke-linecap="round" fill="none"/>
+  <line id="s2" x1="128.00" y1="100.70" x2="167.00" y2="139.70" stroke="rgba(0,170,0,1.00)" stroke-width="0.78" stroke-linecap="round"/>
+  <circle id="v0" cx="50.00" cy="100.70" r="3" fill="#dc3232" data-type="corner"/>
+  <circle id="v1" cx="128.00" cy="100.70" r="3" fill="#dc3232" data-type="corner"/>
+  <circle id="v2" cx="206.00" cy="100.70" r="3" fill="#dc3232" data-type="corner"/>
+  <circle id="v3" cx="89.00" cy="139.70" r="3" fill="#dc3232" data-type="corner"/>
+  <circle id="v4" cx="167.00" cy="139.70" r="3" fill="#dc3232" data-type="corner"/>
+  <circle id="v5" cx="128.00" cy="178.70" r="3" fill="#dc3232" data-type="corner"/>
 </svg>

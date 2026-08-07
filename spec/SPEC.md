@@ -1,7 +1,10 @@
-# SmazkaVG v1.1 Formal Specification
+# SmazkaVG v1.3 Formal Specification
 
-> Flat Document Model · SMT + LP/QP Hybrid Solver · Fixed-Point Determinism  
-> Revision 1.1.0 — 2026-08-07
+> Flat Document Model · LP + Convex QP Solver · Fixed-Point Determinism
+> Revision 1.3.1 — 2026-08-07
+> Supersedes v1.1 (SMT-era) and v1.2 (namespace split). This revision
+> documents the reference rasterizer (`src/rasterizer.c`) and resolver
+> (`src/resolver.c`) as shipped.
 
 ---
 
@@ -11,12 +14,13 @@
 2. [Binary Layout](#2-binary-layout)
 3. [Fixed-Point Arithmetic](#3-fixed-point-arithmetic)
 4. [Primitive Types](#4-primitive-types)
-5. [Constraint Types (SMT / LP / QP)](#5-constraint-types-smt--lp--qp)
+5. [Constraint Namespaces](#5-constraint-namespaces)
 6. [Solver Dispatch & Resolution](#6-solver-dispatch--resolution)
 7. [Textual Skin (Line-ASM)](#7-textual-skin-line-asm)
 8. [Profiles & Conformance](#8-profiles--conformance)
 9. [Security & Bounds](#9-security--bounds)
 10. [Normative References](#10-normative-references)
+11. [v1.2 / v1.3 Amendment Summary & Future Work](#11-v12--v13-amendment-summary--future-work)
 
 ---
 
@@ -28,20 +32,19 @@
 |---|---|
 | **Flat Document** | All primitives and constraints are declared in a single-level list with global 32-bit IDs. There is **no nesting, no tree, no DAG** in the serialization. Hierarchy, ordering, and grouping are emulated via constraints. |
 | **Fixed-Point Determinism** | All stored numerical values use Two's Complement fixed-point (Q16.16 or Q32.32) with saturating arithmetic. No IEEE 754 in storage. |
-| **Declarative Constraints** | All relationships between primitives are expressed as typed constraints. The solver (SMT for discrete/logical, LP/QP for continuous optimization) resolves them into a concrete scene graph. |
-| **Bounded Computation** | Every solver iteration, loop, and recursion has a compile-time or header-declared upper bound. No unbounded computation is permitted. |
+| **Declarative Constraints** | All relationships between primitives are expressed as typed constraints, split into four sections: `s` (structural), `a` (assertions), `c` (constraints), `p` (paint). |
+| **Bounded Computation** | The constraint language is restricted to a **decidable, convex, polynomial-time fragment** (LP + convex QP). Every loop is bounded by header-declared `MAX_ITER` / `MAX_MS`. No unbounded computation is permitted. |
 | **Binary-First** | The canonical format is binary. The textual Line-ASM projection is lossless and maps 1:1 to the binary. |
+| **First-Class Curves** | Edges are 1D spines (segment, quadratic/cubic/rational Bézier, Catmull-Rom) shared between faces. Strokes are profiles along the spine, not independent polylines. |
 
-### 1.2 Comparison with Prior Formats
+### 1.2 Revision History
 
-| Feature | SVG | TinyVG | VGC | SmazkaVG v1.1 |
-|---|---|---|---|---|
-| Document model | Nested XML tree | Flat binary records | Topological VGC | **Flat binary + constraint graph** |
-| Arithmetic | IEEE 754 float | Q16.16 fixed | IEEE 754 float | **Q16.16 / Q32.32 saturating** |
-| Solver | None | None | Constraint (LP) | **SMT + LP/QP hybrid** |
-| Hierarchy | DOM tree | Group IDs | Edge/face trees | **Flat + `parent` constraints** |
-| Animation | SMIL/CSS | None | Keyframes | **Constraint-based state machines** |
-| Topology | Paths (duplicated) | Paths | Half-edge mesh | **Half-edge + SMT topology rules** |
+| Revision | What changed |
+|---|---|
+| v1.1 | Original spec: SMT + LP/QP hybrid, single `c` table, straight edges only. |
+| v1.2 | SMT removed (non-convex, undecidable in general). Namespace split into `s`/`a`/`c`/`p`. Cubic Bézier + B-spline + Spiro edges. Variable-width stroke profiles. Cyclic parent = equilibrium rigging (convex QP). Unified RGBA. Labeled node fields. Convex-QP enforcement at parse time. |
+| v1.3 | Reference rasterizer: per-pixel distance-field rendering (no tessellation). Curve types extended: `quad`, `rational` (conic), `catmull`. New primitives: `r` arc, `z` ellipse. Vertex types (`corner`/`smooth`/`symmetric`/`auto`). Face inline fill field. View-fit includes control points. WebP export. |
+| v1.3.1 | Audit pass: parser bounds-checking, ear-clipping face fills, true taper rendering, curve-aware diffusion brush, resolver fixes (cycle detection, state-machine activation, SLP min_dist). |
 
 ---
 
@@ -51,24 +54,25 @@
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  HEADER (32 bytes, 4-byte aligned)                  │
+│  HEADER (48 bytes, 4-byte aligned)                  │
 ├─────────────────────────────────────────────────────┤
 │  PRIMITIVES TABLE                                   │
-│    ├─ Vertex records   (variable count)             │
-│    ├─ Edge records     (variable count)             │
-│    ├─ Face records     (variable count)             │
-│    ├─ Stroke records   (variable count)             │
-│    ├─ Curve records    (variable count)             │
-│    └─ Node records     (variable count)             │
+│    ├─ Vertex records   (type 0x01)                  │
+│    ├─ Edge records     (type 0x02)                  │
+│    ├─ Face records     (type 0x03)                  │
+│    ├─ Stroke records   (type 0x04)                  │
+│    ├─ Node records     (type 0x06)                  │
+│    ├─ Arc records      (type 0x07)                  │
+│    └─ Ellipse records  (type 0x08)                  │
 ├─────────────────────────────────────────────────────┤
-│  CONSTRAINTS TABLE                                  │
-│    ├─ SMT constraints  (discrete/logical)           │
-│    ├─ LP constraints   (linear inequalities)        │
-│    └─ QP constraints   (quadratic objectives)       │
+│  CONSTRAINTS TABLE  (section-tagged, see §5)        │
+│    ├─ s structural    (tag 0x10)                    │
+│    ├─ a assertions    (tag 0x20)                    │
+│    ├─ c constraints   (tag 0x30: LP / convex QP)    │
+│    └─ p paint         (tag 0x40)                    │
 ├─────────────────────────────────────────────────────┤
 │  PAYLOAD SECTION                                    │
-│    ├─ AST blobs (analytic functions)                │
-│    ├─ Texture blobs (zstd-compressed)               │
+│    ├─ Texture blobs (zstd-compressed, optional)     │
 │    └─ Metadata key-value pairs                      │
 ├─────────────────────────────────────────────────────┤
 │  FOOTER (8 bytes)                                   │
@@ -78,51 +82,52 @@
 ```
 
 All multi-byte integers are **Little-Endian**. All sections are padded to **4-byte alignment**.
+A compact reference container (delta-VLQ encoding, §11.2) ships in `tools/`.
 
-### 2.2 Header (32 bytes)
+### 2.2 Header (48 bytes)
 
 ```
 Offset  Size  Field              Description
 ──────  ────  ─────────────────  ───────────────────────────────────────
 0x00    4     magic              0x534D5647 ("SMVG" in ASCII)
 0x04    2     version_major      uint16, current = 1
-0x06    2     version_minor      uint16, current = 1
+0x06    2     version_minor      uint16, current = 3
 0x08    4     flags              uint32 bitmask (see §2.3)
 0x0C    4     n_vertices         uint32
 0x10    4     n_edges            uint32
 0x14    4     n_faces            uint32
 0x18    4     n_strokes          uint32
-0x1C    4     n_curves           uint32
-0x20    4     n_nodes            uint32
-0x24    4     n_constraints      uint32
-0x28    4     solver_config      uint32 (see §2.4)
-0x2C    4     header_crc         uint32 CRC-32C of bytes [0x00..0x2B]
+0x1C    4     n_nodes            uint32
+0x20    4     n_arcs             uint32
+0x24    4     n_ellipses         uint32
+0x28    4     n_constraints      uint32
+0x2C    4     solver_config      uint32 (see §2.4)
+0x30    4     header_crc         uint32 CRC-32C of bytes [0x00..0x2F]
 ```
 
-**Total: 48 bytes** (padded to 48, which is 4-byte aligned).
-
-> Note: The original design used magic "ANIV"; this revision uses "SMVG" (0x534D5647) for brand clarity. The magic is checked first during parsing.
+**Total: 52 bytes** (padded to 52, 4-byte aligned). The v1.1 header layout (48 bytes, `n_curves`) is superseded; readers must reject v1.1-style headers with `version_minor < 2`.
 
 ### 2.3 Header Flags (bitmask at offset 0x08)
 
 | Bit | Name | Meaning |
 |---|---|---|
-| 0 | `HAS_SMT` | Document contains SMT (logical/discrete) constraints |
-| 1 | `HAS_LP` | Document contains LP (linear programming) constraints |
-| 2 | `HAS_QP` | Document contains QP (quadratic programming) constraints |
-| 3 | `HAS_AST` | Document contains analytic AST blobs in payload |
+| 0 | `HAS_ASSERT` | Document contains `a` (assertion) records |
+| 1 | `HAS_LP` | Document contains LP constraints |
+| 2 | `HAS_CONVEX_QP` | Document contains convex QP constraints (v1.2: was `HAS_QP`; non-convex QP is a **parse error**) |
+| 3 | `HAS_PAINT` | Document contains `p` (paint) records |
 | 4 | `HAS_PAYLOAD` | Document has zstd-compressed payload section |
 | 5 | `Q32` | Coordinates use Q32.32 instead of Q16.16 |
 | 6 | `COLORSPACE_LINEAR` | Colors stored in linear light (default is sRGB) |
-| 7 | `ANIMATED` | Document contains temporal/animation constraints |
-| 8–31 | Reserved | Must be zero |
+| 7 | `ANIMATED` | Document contains state-machine (automata) records |
+| 8 | `RIG_MODE` | `s parent` contains cycles; renders as equilibrium rigging (§5.1.3) |
+| 9–31 | Reserved | Must be zero |
 
-### 2.4 Solver Config (offset 0x28)
+### 2.4 Solver Config (offset 0x2C)
 
 ```
 Bits 0–7:   MAX_ITER       (uint8, default 64, solver iteration cap per resolve)
 Bits 8–15:  MAX_MS         (uint8, solver wall-clock cap, default 50ms, units = 1ms)
-Bits 16–23: SMT_STRATEGY   (uint8: 0=basic, 1=interval-propagation, 2=bit-vector)
+Bits 16–23: SMT_STRATEGY   (reserved; must be 0 in v1.2+)
 Bits 24–31: PROFILE_ID     (uint8: 0=full, 1=web-safe, 2=print-pdf, 3=cad-exact, 4=anime-prod)
 ```
 
@@ -143,11 +148,9 @@ Bits 24–31: PROFILE_ID     (uint8: 0=full, 1=web-safe, 2=print-pdf, 3=cad-exac
 - **Conversion** (API boundary only):
   - `to_fixed_q16(x) = clamp(round(x * 65536), INT32_MIN, INT32_MAX)`
   - `from_fixed_q16(v) = (double)v / 65536.0`
-- **No IEEE 754 in storage.** Floats may exist only in temporary solver scratch memory.
+- **No IEEE 754 in storage.** Floats may exist only in temporary solver/rasterizer scratch memory.
 
 ### 3.3 Saturating Arithmetic
-
-All arithmetic on fixed-point values uses **saturating (clamped) operations**:
 
 ```c
 // Saturating addition for Q16.16
@@ -161,7 +164,7 @@ static inline int32_t q16_add_sat(int32_t a, int32_t b) {
 // Saturating multiplication for Q16.16 (result is Q16.16)
 static inline int32_t q16_mul_sat(int32_t a, int32_t b) {
     int64_t prod = (int64_t)a * (int64_t)b;
-    int64_t result = prod >> 16;  // shift back to Q16.16
+    int64_t result = prod >> 16;
     if (result > INT32_MAX) return INT32_MAX;
     if (result < INT32_MIN) return INT32_MIN;
     return (int32_t)result;
@@ -170,7 +173,7 @@ static inline int32_t q16_mul_sat(int32_t a, int32_t b) {
 // Saturating division for Q16.16
 static inline int32_t q16_div_sat(int32_t a, int32_t b) {
     if (b == 0) return (a >= 0) ? INT32_MAX : INT32_MIN;
-    int64_t num = (int64_t)a << 16;  // promote to Q32.16 intermediate
+    int64_t num = (int64_t)a << 16;
     int64_t result = num / (int64_t)b;
     if (result > INT32_MAX) return INT32_MAX;
     if (result < INT32_MIN) return INT32_MIN;
@@ -178,28 +181,13 @@ static inline int32_t q16_div_sat(int32_t a, int32_t b) {
 }
 ```
 
-### 3.4 Overflow Semantics
+### 3.4 Saturation Hazard (Q16.16)
 
-| Operation | Overflow Behavior |
-|---|---|
-| Add | Saturate to `INT32_MAX` or `INT32_MIN` |
-| Subtract | Saturate to `INT32_MAX` or `INT32_MIN` |
-| Multiply | Saturate to `INT32_MAX` or `INT32_MIN` |
-| Divide by zero | Return `INT32_MAX` (if numerator ≥ 0) or `INT32_MIN` |
-| Negate of `INT32_MIN` | Returns `INT32_MAX` |
-
-### 3.5 Solver-Side Arithmetic
-
-The LP/QP solver (psolve) operates internally on `double` for numerical stability. Fixed-point values are **promoted to double** at the solver API boundary. The solver's output is **quantized back** to fixed-point before storage:
-
-```
-fixed → double → [solver computes] → double → fixed (round + saturate)
-```
-
-This promotion is deterministic because:
-1. The input fixed-point values are exact (no floating-point representation ambiguity).
-2. The solver is seeded deterministically (no random perturbation).
-3. The output is rounded via `round()` (not truncation) and saturated.
+Saturating storage means coordinates outside [−32768, +32767] **clamp**, they do
+not wrap. A renderer must therefore **clip in view space** and only saturate at
+the storage boundary. The reference rasterizer keeps coordinates as IEEE-754
+`double` in scratch memory (deterministic: storage is exact, conversion is
+`round()` + clamp) and only quantizes when a binary container is written.
 
 ---
 
@@ -207,16 +195,15 @@ This promotion is deterministic because:
 
 ### 4.1 Primitive Type Tags
 
-Each primitive record begins with a 1-byte type tag:
-
 | Tag | Type | Record Size (bytes) |
 |---|---|---|
 | `0x01` | Vertex | 16 |
-| `0x02` | Edge | 12 |
-| `0x03` | Face | variable (4 + 4×n_vertices) |
+| `0x02` | Edge | 12 + 8×n_cp + 4×n_w |
+| `0x03` | Face | variable |
 | `0x04` | Stroke | variable (see §4.5) |
-| `0x05` | AnalyticCurve | variable (see §4.6) |
 | `0x06` | Node (transform group) | 28 |
+| `0x07` | Arc | 28 |
+| `0x08` | Ellipse | 40 |
 
 ### 4.2 Vertex Record (16 bytes)
 
@@ -224,7 +211,7 @@ Each primitive record begins with a 1-byte type tag:
 Offset  Size  Field     Description
 ──────  ────  ───────  ────────────────────────────────
 0x00    1     type     0x01
-0x01    1     pad      Reserved (0x00)
+0x01    1     vtype    0=corner 1=smooth 2=symmetric 3=auto (Inkscape-style)
 0x02    2     id       uint16 global vertex ID
 0x04    4     x        Q16.16 x-coordinate
 0x08    4     y        Q16.16 y-coordinate
@@ -233,20 +220,35 @@ Offset  Size  Field     Description
 
 When `Q32` flag is set, `x` and `y` are each Q32.32 (8 bytes), making the record 24 bytes.
 
-### 4.3 Edge Record (12 bytes)
+### 4.3 Edge Record
 
 ```
 Offset  Size  Field     Description
 ──────  ────  ───────  ────────────────────────────────
 0x00    1     type     0x02
-0x01    1     pad      Reserved (0x00)
+0x01    1     etype    0=seg 1=quad 2=cubic 3=rational 4=catmull
 0x02    2     id       uint16 global edge ID
 0x04    2     v_start  uint16 ID of start vertex
 0x06    2     v_end    uint16 ID of end vertex
-0x08    4     flags    uint32 (bit 0: shared, bit 1: boundary, bit 2: diffusion, bits 3-31: reserved)
+0x08    1     n_cp     number of control points
+0x09    1     pad      Reserved (0x00)
+0x0A    4     flags    uint32 (bit 0: shared, bit 1: boundary, bit 2: diffusion, bits 3-31: reserved)
+       8×n_cp  ctrl    Q16.16 (x,y) control points
+       4×n_w   weight  Q16.16 weights (rational edges only)
 ```
 
-Edges are **first-class shared primitives** (VGC-derived). Multiple faces can reference the same edge.
+Curve types:
+
+| etype | Control points | Interpretation |
+|---|---|---|
+| `seg` | 0 | Straight segment v_start→v_end |
+| `quad` | 1 | Quadratic Bézier |
+| `cubic` | 2 | Cubic Bézier |
+| `rational` | 2 (+2 weights) | Rational quadratic (conic): weights `(1, w0, 1)`; a second weight is reserved |
+| `catmull` | 0 | Catmull-Rom through v_start, v_end; neighbors chosen automatically |
+
+Control points are **geometry, not topology**: two faces sharing an edge render
+the same curved spine.
 
 ### 4.4 Face Record (variable size)
 
@@ -257,12 +259,15 @@ Offset  Size  Field     Description
 0x01    1     pad      Reserved (0x00)
 0x02    2     id       uint16 global face ID
 0x04    2     n_edges  uint16 number of edges in face boundary
-0x06    2     n_holes  uint16 number of hole loops
-0x08    4     fill_id  uint32 fill reference (0 = none)
-0x0C    4×n   edges    uint16[] edge IDs (winding: positive = same direction, negative = reversed)
+0x06    2     n_holes  uint16 number of hole loops (0 in v1.3)
+0x08    4     fill     uint32 inline fill color 0xRRGGBB (0 = none; `p solid_fill` overrides)
+0x0C    4×n   edges    uint16[] edge IDs in boundary order
 ```
 
-The face record size is `12 + 4×n_edges + 4×n_holes + 4×n_holes_edges` bytes, padded to 4-byte alignment.
+The boundary is a **closed chain**: consecutive edges share a vertex. A reader
+must reconstruct the ordered boundary and may use ear-clipping to fill concave
+or curved-boundary faces. Faces are filled with a `p solid_fill` paint record,
+or with the inline `fill` field if present.
 
 ### 4.5 Stroke Record (variable size)
 
@@ -270,33 +275,22 @@ The face record size is `12 + 4×n_edges + 4×n_holes + 4×n_holes_edges` bytes,
 Offset  Size  Field          Description
 ──────  ────  ─────────────  ────────────────────────────────
 0x00    1     type           0x04
-0x01    1     width_mode     0=constant, 1=variable, 2=pressure-driven
+0x01    1     width_mode     0=constant, 1=variable profile, 2=pressure-driven
 0x02    2     id             uint16 global stroke ID
-0x04    2     n_ctrl_pts     uint16 number of control points
-0x06    2     edge_id        uint16 associated edge (or 0xFFFF = none)
+0x04    2     edge_id        uint16 associated edge
+0x06    2     n_widths       uint16 number of width samples
 0x08    4     color          uint32 packed RGBA (8 bits/channel)
-0x0C    4     width_base     Q16.16 base stroke width
-0x10    8×n   ctrl_points    Q16.16 (x,y) pairs for cubic Bézier control points
+0x0C    1     cap            stroke cap: 0=round (default), 1=butt, 2=square
+0x0D    3     pad            Reserved
+0x10    4×n   widths         Q16.16 width at t = i/(n-1) for i in [0, n)
 ```
 
-Variable-width strokes additionally carry a width profile (array of Q16.16 values at uniform parameter intervals).
+The width profile is a **function along the edge parameter t ∈ [0,1]**; the
+rasterizer interpolates linearly between samples. A single width value is
+equivalent to a constant profile. `join` attributes (miter/round/bevel) are
+reserved for future revisions (they require path-level geometry).
 
-### 4.6 AnalyticCurve Record (variable size)
-
-```
-Offset  Size  Field          Description
-──────  ────  ─────────────  ────────────────────────────────
-0x00    1     type           0x05
-0x01    1     curve_kind     0=Bézier, 1=B-spline, 2=spiral, 3=SDF-contour
-0x02    2     id             uint16 global curve ID
-0x04    2     ast_offset     uint16 offset into payload section for AST blob
-0x06    2     ast_size       uint16 size of AST blob in bytes
-0x08    4     flags          uint32 (bit 0: closed, bit 1: diffusion-left, bit 2: diffusion-right, bits 3-31: reserved)
-```
-
-### 4.7 Node Record (28 bytes)
-
-Nodes are the **transform hierarchy emulators**. They carry a local transform and reference a parent via constraints (not nesting).
+### 4.6 Node Record (28 bytes)
 
 ```
 Offset  Size  Field          Description
@@ -313,120 +307,168 @@ Offset  Size  Field          Description
 0x1C    4     content_ref    uint32 reference to primitive ID this node transforms (0 = none)
 ```
 
+### 4.7 Arc Record (28 bytes)
+
+```
+Offset  Size  Field          Description
+──────  ────  ─────────────  ────────────────────────────────
+0x00    1     type           0x07
+0x01    1     pad
+0x02    2     id             uint16
+0x04    4     cx             Q16.16 center x
+0x08    4     cy             Q16.16 center y
+0x0C    4     r              Q16.16 radius
+0x10    4     a0             Q16.16 start angle (degrees)
+0x14    4     a1             Q16.16 end angle (degrees, may be < a0 for wrap-around)
+0x18    4     color          uint32 RGBA
+0x1C    4     lw             Q16.16 line width
+```
+
+### 4.8 Ellipse Record (40 bytes)
+
+```
+Offset  Size  Field          Description
+──────  ────  ─────────────  ────────────────────────────────
+0x00    1     type           0x08
+0x01    1     pad
+0x02    2     id             uint16
+0x04    4     cx, cy         Q16.16 center
+0x0C    4     rx, ry         Q16.16 radii
+0x14    4     rot            Q16.16 rotation (radians)
+0x18    4     fill           uint32 RGBA fill
+0x1C    4     stroke         uint32 RGBA stroke (alpha 0 = no stroke)
+0x20    4     sw             Q16.16 stroke width
+```
+
 ---
 
-## 5. Constraint Types (SMT / LP / QP)
+## 5. Constraint Namespaces
 
-### 5.1 Constraint Record Header
+### 5.1 Sections
 
-Every constraint record begins with:
+Every constraint record begins with a 1-byte section tag, 1-byte subtype, and
+2-byte ID. The sections are processed by different pipeline stages:
 
-```
-Offset  Size  Field       Description
-──────  ────  ──────────  ────────────────────────────────────
-0x00    1     type        0x10 (SMT), 0x20 (LP), 0x30 (QP)
-0x01    1     subtype     uint8, see tables below
-0x02    2     id          uint16 global constraint ID
-0x04    2     payload_sz  uint16 size of constraint-specific payload
-```
-
-### 5.2 SMT Constraint Subtypes (type = 0x10)
-
-SMT constraints handle **discrete logic, topology rules, and non-linear reasoning**.
-
-| Subtype | Name | Payload Format | SMT Theory |
+| Tag | Section | Contents | Processing |
 |---|---|---|---|
-| `0x01` | `edge_connects` | `edge_id(u16), v_start(u16), v_end(u16)` | Uninterpreted Functions |
-| `0x02` | `parent` | `child_id(u16), parent_id(u16)` | Integer Arithmetic |
-| `0x03` | `group_id` | `prim_id(u16), group(u16)` | Integer Arithmetic |
-| `0x04` | `above` | `prim_a(u16), prim_b(u16)` | Integer Arithmetic (ordering) |
-| `0x05` | `contains` | `outer_id(u16), inner_id(u16)` | Real Arithmetic + SDF |
-| `0x06` | `state_machine` | `state_id(u16), n_transitions(u16), transitions[]` | Bit-vector / Fixed-point |
-| `0x07` | `disjunction` | `n_choices(u16), choice_constraint_ids[]` | Boolean |
-| `0x08` | `bound_check` | `prim_id(u16), dim(u8), lo(Q16.16), hi(Q16.16)` | Bit-vector (overflow) |
-| `0x09` | `xor` | `constraint_a(u16), constraint_b(u16)` | Boolean |
-| `0x0A` | `implication` | `antecedent(u16), consequent(u16)` | Boolean |
+| `0x10` | `s` **Structural** | `parent`, `group_id` | Builds the scene graph; no solver |
+| `0x20` | `a` **Assertions** | `edge_connects`, `bound_check`, `state_machine` | Validated / simulated; errors reported, not solved |
+| `0x30` | `c` **Constraints** | `min_dist`, `bbox_clamp`, `linear_*`, `collision_free` (LP); `min_curvature`, `ik_target`, `fair_blend`, `rig` (convex QP) | Solved by LP / convex QP |
+| `0x40` | `p` **Paint** | `diffusion`, `solid_fill` | Routed to the rasterizer, never solved |
 
-#### 5.2.1 `state_machine` Payload Detail
+Rationale (from the v1.2 changelog): `s parent` is structural data; `a
+edge_connects` restates `e <id> <v0> <v1>` and is a redundant assertion; `p
+diffusion` specifies colors, not solver constraints. Only `c` records feed the
+LP/QP solver.
 
-```
-Offset  Size  Field             Description
-──────  ────  ────────────────  ────────────────────────────────
-0x00    2     state_id          uint16
-0x02    2     n_transitions     uint16
-0x04    2     initial_state     uint16
-0x06    2     pad               Reserved
-0x08    8×n   transitions[]     Each transition:
-                                   - target_state (u16)
-                                   - trigger_type (u16: 0=time, 1=event, 2=condition)
-                                   - trigger_param (Q16.16: time/frame/threshold)
-```
+### 5.2 Structural (s)
 
-Cycles are permitted (e.g., A→B→A). The solver resolves via **fixed-point iteration** over blend weights.
-
-### 5.3 LP Constraint Subtypes (type = 0x20)
-
-LP constraints express **linear inequalities and equalities** for continuous optimization.
-
-| Subtype | Name | Payload Format | Description |
+| Subtype | Name | Payload | Meaning |
 |---|---|---|---|
-| `0x01` | `min_dist` | `prim_a(u16), prim_b(u16), distance(Q16.16)` | Distance ≥ d between primitives |
-| `0x02` | `diffusion` | `edge_id(u16), left_color(u32), right_color(u32)` | Poisson equation for color diffusion |
-| `0x03` | `linear_eq` | Variable-length: `n_terms(u16), (var_id(u16), coeff(Q16.16))[]` | Σ(coeff_i × var_i) = rhs |
-| `0x04` | `linear_le` | Same as `linear_eq` but inequality ≤ | Σ(coeff_i × var_i) ≤ rhs |
-| `0x05` | `linear_ge` | Same as `linear_eq` but inequality ≥ | Σ(coeff_i × var_i) ≥ rhs |
-| `0x06` | `bbox_clamp` | `prim_id(u16), x_min(Q16.16), y_min(Q16.16), x_max(Q16.16), y_max(Q16.16)` | Variable bounded in rectangle |
-| `0x07` | `collision_free` | `stroke_a(u16), stroke_b(u16), margin(Q16.16)` | Strokes do not overlap |
-| `0x08` | `flow_conservation` | `node_id(u16), flow_var(Q16.16)` | Network flow balance |
+| `0x01` | `parent` | `child_id(u16), parent_id(u16)` | child's transform is composed with parent's |
+| `0x02` | `group_id` | `prim_id(u16), group(u16)` | tags primitives with group membership |
 
-#### 5.3.1 Diffusion Curve Resolution
+#### 5.2.1 Cyclic parent semantics (RIG_MODE)
 
-The `diffusion` constraint generates a **Laplacian linear system** over the mesh:
+- **Acyclic chains** (tree): standard bottom-up transform multiplication, O(n).
+- **Cyclic chains** (A→B→C→A): interpreted as a **soft equilibrium rigging
+  constraint**, solved as a convex QP:
+  ```
+  minimize  Σ_i ‖world_i − local_i‖²
+  subject to  world_child ≈ world_parent × local_child   (soft, penalized)
+  ```
+  The header flag `RIG_MODE` (bit 8) is set; renderers that don't support rig
+  mode must reject the file or fall back to treating every node as a root. If
+  the solver fails to converge within `MAX_ITER`, the file is invalid.
 
-```
-L · c = b
-```
+### 5.3 Assertions (a)
 
-Where:
-- `L` is the discrete Laplacian matrix (cotangent weights, computed from vertex positions)
-- `c` is the vector of unknown colors at each vertex
-- `b` encodes boundary conditions: vertices adjacent to the diffusion edge get `left_color` on one side and `right_color` on the other
-
-This is solved via the LP solver (linear system = LP with equality constraints).
-
-### 5.4 QP Constraint Subtypes (type = 0x30)
-
-QP constraints express **quadratic objectives** subject to linear constraints.
-
-| Subtype | Name | Payload Format | Objective |
+| Subtype | Name | Payload | Meaning |
 |---|---|---|---|
-| `0x01` | `min_curvature` | `curve_id(u16), weight(Q16.16)` | min ∫ κ² ds (Euler-elastica) |
-| `0x02` | `min_stretch` | `node_id(u16), weight(Q16.16)` | min ‖Δx‖² (elastic deformation) |
-| `0x03` | `ik_target` | `bone_chain_id(u16), target_x(Q16.16), target_y(Q16.16), weight(Q16.16)` | min Σ w_i ‖p_i − target‖² |
-| `0x04` | `fair_blend` | `n_vars(u16), var_ids[]` | min Σ(x_i − x̄)² subject to Σx_i = 1 |
-| `0x05` | `cage_deform` | `cage_id(u16), weight(Q16.16)` | min ‖M·x − b‖² (mean-value coordinates) |
+| `0x01` | `edge_connects` | `edge_id(u16), v_start(u16), v_end(u16)` | Asserts edge endpoints; violations are repaired + warned |
+| `0x02` | `bound_check` | `prim_id(u16), dim(u8), lo(Q16.16), hi(Q16.16)` | Clamps a coordinate into `[lo, hi]` (saturating) |
+| `0x03` | `state_machine` | `state_id(u16), initial(u16), transitions[]` | Per-frame animation automaton (§5.3.1) |
 
-#### 5.4.1 QP Standard Form
+#### 5.3.1 state_machine
 
-All QP constraints are reduced to the standard form for the solver:
+Each machine has states `S_0..S_{n-1}` (where `n = n_transitions + 1`) and
+transitions with triggers. At resolve time the current frame (document clock)
+evaluates every trigger:
 
-```
-minimize    ½ xᵀQx + cᵀx
-subject to  Ax ≤ b
-            l ≤ x ≤ u
-```
+| trigger_type | Activation |
+|---|---|
+| `0` time | ramp `(frame − start_frame) / duration` clamped to `[0,1]` |
+| `1` event | 1 if the event is active, else 0 |
+| `2` condition | 1 if `clock.input ≥ param`, else 0 |
 
-Where `Q` is a positive semi-definite matrix, `A` is a linear constraint matrix, and `l, u` are variable bounds.
+The initial state carries a base activation of 1.0; activations are max-combined
+and **normalised to weights** `w_i` (Σw = 1). The blended transform is
+`Σ w_i × xform(S_i)`. For fully cyclic machines the steady state is the fixed
+point of the transition matrix, computed by bounded iteration (≤ `MAX_ITER`).
+The v1.1 behavior — a constant uniform blend `w_i = 1/n` that made every
+animation a static average — is **removed**.
 
-**Building QP from psolve's LP core:**
+### 5.4 Constraints (c) — LP
 
-The QP solver is implemented as an **active-set method** that wraps the LP simplex:
-1. Start from the LP-feasible vertex (solved via psolve).
-2. Identify the active set of inequality constraints.
-3. Compute the QP search direction by solving a linear system (Newton step on the quadratic objective restricted to the active manifold).
-4. Perform a line search along the direction, respecting bounds.
-5. Update the active set (add violated constraints, drop constraints with negative multipliers).
-6. Repeat until convergence or `MAX_ITER`.
+| Subtype | Name | Payload | Description |
+|---|---|---|---|
+| `0x01` | `min_dist` | `prim_a(u16), prim_b(u16), distance(Q16.16)` | L2 distance ≥ d between primitives |
+| `0x02` | `linear_eq` | `n_terms, (var_id, coeff)[]`, `rhs` | Σ coeff·var = rhs |
+| `0x03` | `linear_le` | same | ≤ |
+| `0x04` | `linear_ge` | same | ≥ |
+| `0x05` | `bbox_clamp` | `prim_id, x_min, y_min, x_max, y_max` | variable bounds |
+| `0x06` | `collision_free` | `stroke_a, stroke_b, margin` | sampled stroke separation ≥ margin |
+
+#### 5.4.1 min_dist / collision_free semantics (honest formulation)
+
+The L2 constraint ‖p_a − p_b‖₂ ≥ d is **non-convex** (the feasible region is
+the exterior of a ball); no single fixed LP row can express it. The reference
+solver uses **sequential linear programming (SLP)**:
+
+1. Sample the closest pair of points between the primitives at the current iterate.
+2. Add the *directional separation row*
+   `(p_b − p_a)·u ≥ d`  where `u = (p_b − p_a)/‖p_b − p_a‖`.
+   This is a valid linear over-approximation of the separating hyperplane: it
+   only cuts the half-space that actually violates the constraint.
+3. Re-solve and re-sample until the true L2 distance is satisfied (2–3
+   iterations typical; bounded by `MAX_ITER`).
+
+The v1.1 relaxation — adding `x_a − x_b ≥ d/√2` **and** `y_a − y_b ≥ d/√2`
+simultaneously — is **removed**: it forced prim_a to always sit strictly NE of
+prim_b, making feasible layouts infeasible. Exact L2 separation needs SOCP/MIP,
+which is out of scope for the pure-LP backend and documented as a known
+limitation.
+
+### 5.5 Constraints (c) — convex QP
+
+| Subtype | Name | Payload | Objective |
+|---|---|---|---|
+| `0x11` | `min_curvature` | `curve_id(u16), weight(Q16.16)` | min ∫κ² ds ≈ min Σ‖p_{i−1} − 2p_i + p_{i+1}‖² (tridiagonal Q) |
+| `0x12` | `ik_target` | `chain_id, target_x, target_y, weight` | min ‖J·Δθ − (target − ee)‖² (Jacobian least-squares) |
+| `0x13` | `fair_blend` | `n_vars, var_ids[]` | min Σ(x_i − 1/n)² s.t. Σx_i = 1, x_i ≥ 0 (max-entropy blend) |
+| `0x14` | `rig` | `node_a, node_b` | equilibrium rigging for cyclic parents (§5.2.1) |
+
+**Enforcement:** at parse time the reader validates that every QP matrix is
+positive semi-definite. Non-convex QP is a **parse error**, not a runtime
+failure. Solver runtime is bounded by O(n³ + n²·MAX_ITER).
+
+### 5.6 Paint (p)
+
+| Subtype | Name | Payload | Meaning |
+|---|---|---|---|
+| `0x01` | `diffusion` | `edge_id, left_color(RGBA), right_color(RGBA)` | smooth color field across the edge (see §5.6.1) |
+| `0x02` | `solid_fill` | `face_id, color(RGBA)` | flat fill; overrides the face's inline `fill` |
+
+#### 5.6.1 Diffusion curves — honest description
+
+The v1.1 spec promised a discrete cotangent-Laplacian PDE solve
+(`L·c = b`, Orzan et al. 2008). The v1.3 reference rasterizer implements a
+**signed-distance curve brush**: for each pixel within the falloff radius of
+the diffusion edge, the color blends left→right across the signed distance from
+the curve's closest point, with a linear falloff in distance. It follows curved
+spines (the v1.1 brush was a straight-line perpendicular gradient only) but it
+is **not** a PDE diffusion and does not flow around topology. A full
+cotangent-Laplacian solver over the face mesh is planned (see §11.1).
 
 ---
 
@@ -436,89 +478,47 @@ The QP solver is implemented as an **active-set method** that wraps the LP simpl
 
 ```
                     ┌──────────────────┐
-                    │  Constraint List │
-                    │  (flat, typed)   │
+                    │  Record stream   │
+                    │  (s / a / c / p) │
                     └────────┬─────────┘
                              │
                     ┌────────▼─────────┐
                     │   Classifier     │
-                    │  (dispatch logic)│
                     └────────┬─────────┘
                              │
               ┌──────────────┼──────────────┐
               │              │              │
      ┌────────▼──────┐ ┌────▼─────┐ ┌──────▼──────┐
-     │  SMT Solver   │ │LP Solver │ │ QP Solver   │
-     │ (interval +   │ │(psolve   │ │(active-set  │
-     │  fixed-point) │ │ simplex) │ │ over psolve)│
+     │ Structural    │ │  LP      │ │ Convex QP   │
+     │ + assertions  │ │ (psolve  │ │ (active-set │
+     │ (no solver)   │ │  simplex)│ │  over psolve)│
      └───────────────┘ └──────────┘ └─────────────┘
 ```
 
 ### 6.2 Dispatch Rules
 
-The classifier inspects each constraint's type and subtype:
-
 ```
-IF constraint.type == SMT (0x10):
-    → Route to SMT solver
-    
-ELIF constraint.type == LP (0x20):
-    IF subtype IN {min_dist, collision_free, bbox_clamp, linear_eq, linear_le, linear_ge, flow_conservation}:
-        → Accumulate into LP system → solve with psolve
-    ELIF subtype == diffusion:
-        → Build Laplacian system → solve as LP (linear equations)
-        
-ELIF constraint.type == QP (0x30):
-    → Accumulate into QP system → solve with active-set over psolve
+IF section == s:      build scene graph (parent/group), detect cycles -> RIG_MODE
+ELIF section == a:    validate (edge_connects), clamp (bound_check),
+                      simulate (state_machine) at current frame
+ELIF section == c:
+    IF subtype <= 0x06:  accumulate into LP -> solve with psolve (SLP for min_dist)
+    ELIF subtype >= 0x11: accumulate into QP -> active-set over psolve
+ELIF section == p:    route to rasterizer (never solved)
 ```
 
-### 6.3 Resolution Order
+### 6.3 Resolution Order (deterministic)
 
-The solver processes constraints in this fixed order (to ensure deterministic results):
+1. **Assertions**: `edge_connects` repair.
+2. **Structural**: parent/group → scene graph; cycle detection; acyclic transform resolution.
+3. **Automata**: `state_machine` → per-frame blend weights.
+4. **LP**: `min_dist` (SLP), `bbox_clamp`, `linear_*`, `collision_free`.
+5. **Convex QP**: `min_curvature`, `ik_target`, `fair_blend`, `rig`.
+6. **Validation**: `bound_check` clamps.
 
-1. **Phase 1: Topology (SMT)** — Resolve `edge_connects`, `parent`, `group_id`, `above` constraints. Build the effective scene hierarchy and adjacency.
-2. **Phase 2: Continuous Optimization (LP)** — Solve `min_dist`, `collision_free`, `diffusion`, `bbox_clamp` constraints. Compute vertex positions, stroke widths, diffusion colors.
-3. **Phase 3: Quadratic Optimization (QP)** — Solve `min_curvature`, `ik_target`, `fair_blend`. Compute spline shapes, bone poses, blend weights.
-4. **Phase 4: Temporal (SMT)** — Resolve `state_machine` constraints. Compute animation blend weights via fixed-point iteration.
-5. **Phase 5: Validation (SMT)** — Run `bound_check` constraints. Verify no fixed-point overflow occurred.
-
-### 6.4 SMT Solving via Interval Propagation + Fixed-Point Iteration
-
-The SMT solver does **not** use a full SMT-LIB backend (too heavy for embedded use). Instead, it implements a **bounded decision procedure**:
-
-**For Boolean/Integer theories (parent, group_id, above, disjunction, xor, implication):**
-- Enumerate small domains (IDs are uint16, so at most 65536 values).
-- Use **unit propagation + backtracking** (DPLL-style) with a clause database.
-- Bounded by `MAX_ITER` backtracks.
-
-**For Real Arithmetic theories (contains, bound_check):**
-- Use **interval arithmetic** over Q16.16 values.
-- Each variable has an interval `[lo, hi]` in Q16.16.
-- Constraint propagation narrows intervals.
-- If an interval becomes empty → UNSAT.
-- If all intervals are singletons → SAT (exact assignment).
-- Otherwise → UNKNOWN (conservative: flag a warning, use midpoint values).
-
-**For Fixed-Point Iteration (cyclic state machines, cyclic transforms):**
-```
-Initialize all unknowns to default values.
-Repeat up to MAX_ITER times:
-    For each cyclic constraint:
-        Compute new value from current assignments.
-        Clamp to Q16.16 range (saturating).
-    IF no value changed by more than 1 Q16.16 unit:
-        Converged → DONE.
-IF not converged:
-    Use last computed values + flag warning.
-```
-
-### 6.5 Timeout & Fallback
-
-Every solver invocation checks a tick counter. If wall-clock time exceeds `MAX_MS` (from header `solver_config`):
-
-1. Halt the current solver.
-2. Return the last known-good state (from the previous successful resolve, or the default state for the first resolve).
-3. Set a `SOLVE_TIMEOUT` warning flag in the document's runtime metadata.
+Every phase checks the wall-clock deadline (`MAX_MS`); on timeout the last
+known-good state is returned with a `SOLVE_TIMEOUT` flag (bit 31 of the warning
+mask). All loops are additionally capped by `MAX_ITER`.
 
 ---
 
@@ -528,159 +528,136 @@ Every solver invocation checks a tick counter. If wall-clock time exceeds `MAX_M
 
 - **One declaration per line** — no nesting, no indentation-based semantics.
 - **`#` comments** — everything after `#` to end of line is ignored.
-- **Fixed-point literals** — decimal numbers are parsed as Q16.16 (multiplied by 65536 and rounded). Hex values prefixed `0x` are raw integer encodings.
+- **Fixed-point literals** — decimal numbers are parsed as Q16.16 (multiplied
+  by 65536 and rounded). Hex values prefixed `0x` are raw integer encodings.
 - **IDs** — unsigned decimal integers.
-- **Colors** — 6-digit hex (RGB) or 8-digit hex (RGBA), no `#` prefix in the value itself (the field position implies color).
+- **Colors** — 6-digit hex (RGB), 8-digit hex (RGBA), or 3-digit hex (#RGB
+  shorthand), no `#` prefix in the value itself.
 
 ### 7.2 Line Types
 
 ```
-# Vertices
-v <id> <x> <y> [flags]
+# Vertices (vtype optional: corner|smooth|symmetric|auto)
+v <id> <x> <y> [vtype]
 
-# Edges  
-e <id> <v_start> <v_end> [flags]
+# Edges (curve type + control points optional)
+e <id> <v_start> <v_end> [type=<seg|quad|cubic|rational|catmull> [cp...] [w...]]
 
-# Faces
-f <id> <edge_0> <edge_1> ... <edge_n> [fill_id]
+# Faces (inline fill optional, overridden by p solid_fill)
+f <id> <edge_0> <edge_1> ... <edge_n> [fill_RRGGBB]
 
-# Strokes
-s <id> <edge_id> <color> <width> [ctrl_x0 ctrl_y0 ctrl_x1 ctrl_y1 ...]
+# Strokes (cap optional: round|butt|square)
+s <id> <edge_id> <color> <w_0> <w_1> ... <w_n> [cap=<round|butt|square>]
 
-# Analytic Curves
-d <id> <kind> <ast_offset> <ast_size> [flags]
-
-# Nodes (transform groups)
+# Nodes (labeled or positional)
+n <id> tx=<tx> ty=<ty> rot=<rot> sx=<sx> sy=<sy> skew=<skew> content=<ref>
 n <id> <tx> <ty> <rot> <sx> <sy> <skew> [content_ref]
 
-# SMT Constraints
-c <id> edge_connects <edge_id> <v_start> <v_end>
-c <id> parent <child_id> <parent_id>
-c <id> group_id <prim_id> <group>
-c <id> above <prim_a> <prim_b>
-c <id> contains <outer_id> <inner_id>
-c <id> state_machine <state_id> <initial> <target_0> <trigger_0> <param_0> ...
-c <id> disjunction <c_id_0> <c_id_1> ...
-c <id> bound_check <prim_id> <dim> <lo> <hi>
-c <id> xor <c_id_a> <c_id_b>
-c <id> implication <antecedent_id> <consequent_id>
+# Arcs
+r <id> <cx> <cy> <r> <a0> <a1> <color> [lw]
 
-# LP Constraints
+# Ellipses
+z <id> <cx> <cy> <rx> <ry> [rot] <fill> [stroke] [sw]
+
+# ── Structural (s) ─────────────────────────────────────────
+s <id> parent <child_id> <parent_id>
+s <id> group_id <prim_id> <group>
+
+# ── Assertions (a) ─────────────────────────────────────────
+a <id> edge_connects <edge_id> <v_start> <v_end>
+a <id> bound_check <prim_id> <x|y> <lo> <hi>
+a <id> state_machine <state_id> <initial> <target> <time|event|condition> <param> ...
+
+# ── Constraints (c) — LP ───────────────────────────────────
 c <id> min_dist <prim_a> <prim_b> <distance>
-c <id> diffusion <edge_id> L <left_color> R <right_color>
+c <id> bbox_clamp <prim_id> <x_min> <y_min> <x_max> <y_max>
 c <id> linear_eq <rhs> <var_0> <coeff_0> <var_1> <coeff_1> ...
 c <id> linear_le <rhs> <var_0> <coeff_0> <var_1> <coeff_1> ...
 c <id> linear_ge <rhs> <var_0> <coeff_0> <var_1> <coeff_1> ...
-c <id> bbox_clamp <prim_id> <x_min> <y_min> <x_max> <y_max>
 c <id> collision_free <stroke_a> <stroke_b> <margin>
-c <id> flow_conservation <node_id> <flow>
 
-# QP Constraints
+# ── Constraints (c) — convex QP ────────────────────────────
 c <id> min_curvature <curve_id> <weight>
-c <id> min_stretch <node_id> <weight>
 c <id> ik_target <chain_id> <target_x> <target_y> <weight>
 c <id> fair_blend <var_0> <var_1> ...
-c <id> cage_deform <cage_id> <weight>
+c <id> rig <node_a> <node_b>
+
+# ── Paint (p) ──────────────────────────────────────────────
+p <id> diffusion <edge_id> L <left_color> R <right_color>
+p <id> solid_fill <face_id> <color>
 
 # Metadata (optional)
 m <key> <value>
 ```
 
+The deprecated v1.1 form `c <id> <smt-constraint>` is accepted by v1.2+ readers
+with a deprecation warning and should be migrated to the split namespaces.
+
 ### 7.3 ABNF Grammar
 
 ```abnf
-; SmazkaVG Line-ASM Grammar (RFC 5234 ABNF)
+; SmazkaVG v1.3 Line-ASM Grammar (RFC 5234 ABNF)
 
 document     = *(line LF)
-line         = comment / vertex / edge / face / stroke / curve / node / constraint / meta / empty
+line         = comment / vertex / edge / face / stroke / node / arc / ellipse
+             / structural / assertion / constraint / paint / meta / empty
 empty        = ""
 comment      = "#" *VCHAR
 LF           = %x0A
 
-; ── Primitives ──────────────────────────────────────────────────────
+vertex       = "v" SP vid SP number SP number [SP vtype]
+vtype        = "corner" / "smooth" / "symmetric" / "auto"
 
-vertex       = "v" SP vid SP number SP number [SP flags]
-edge         = "e" SP eid SP vid SP vid [SP flags]
-face         = "f" SP fid SP 1*(eid) [SP fid]
-stroke       = "s" SP sid SP eid SP hexcolor SP number *(SP number)
-curve        = "d" SP cid SP curve-kind SP uint16 SP uint16 [SP flags]
-node         = "n" SP nid SP number SP number SP number SP number SP number SP number SP number [SP uint32]
+edge         = "e" SP eid SP vid SP vid [SP edge-params]
+edge-params  = "type=" curve-type SP *(number)
+curve-type   = "seg" / "quad" / "cubic" / "rational" / "catmull"
 
-curve-kind   = "bezier" / "bspline" / "spiral" / "sdf"
+face         = "f" SP fid SP 1*(eid) [SP hexcolor]
+stroke       = "s" SP sid SP eid SP hexcolor SP 1*(number) [SP "cap=" cap]
+cap          = "round" / "butt" / "square"
 
-; ── Constraints ─────────────────────────────────────────────────────
+node         = "n" SP nid SP (labeled-node / positional-node)
+labeled-node = "tx=" number SP "ty=" number SP "rot=" number SP "sx=" number
+             SP "sy=" number SP "skew=" number SP "content=" uint32
+positional-node = number SP number SP number SP number SP number SP number [SP uint32]
+
+arc          = "r" SP aid SP number SP number SP number SP number SP number
+             SP hexcolor [SP number]
+ellipse      = "z" SP zid SP number SP number SP number SP number [SP number]
+             SP hexcolor [SP hexcolor] [SP number]
+
+structural   = "s" SP sid SP ("parent" SP nid SP nid / "group_id" SP uint32 SP uint16)
+assertion    = "a" SP aid SP (a-edge / a-bound / a-machine)
+a-edge       = "edge_connects" SP eid SP vid SP vid
+a-bound      = "bound_check" SP uint32 SP dim SP number SP number
+a-machine    = "state_machine" SP uint16 SP uint16 SP 1*(transition)
+transition   = uint16 SP ("time" / "event" / "condition") SP number
+dim          = "x" / "y"
 
 constraint   = "c" SP cid SP constraint-body
+constraint-body = c-min-dist / c-bbox / c-linear / c-collision
+                / c-min-curv / c-ik / c-fair / c-rig
+c-min-dist   = "min_dist" SP uint32 SP uint32 SP number
+c-bbox       = "bbox_clamp" SP uint32 SP number SP number SP number SP number
+c-linear     = ("linear_eq" / "linear_le" / "linear_ge") SP number SP *(variable-term)
+c-collision  = "collision_free" SP sid SP sid SP number
+c-min-curv   = "min_curvature" SP cid SP number
+c-ik         = "ik_target" SP uint32 SP number SP number SP number
+c-fair       = "fair_blend" SP *(uint32)
+c-rig        = "rig" SP nid SP nid
+variable-term = uint32 SP number
 
-constraint-body = smt-constraint / lp-constraint / qp-constraint
+paint        = "p" SP pid SP (p-diffusion / p-fill)
+p-diffusion  = "diffusion" SP eid SP "L" SP hexcolor SP "R" SP hexcolor
+p-fill       = "solid_fill" SP fid SP hexcolor
 
-; SMT
-smt-constraint = c-edge-connects / c-parent / c-group-id / c-above
-               / c-contains / c-state-machine / c-disjunction
-               / c-bound-check / c-xor / c-implication
+meta         = "m" SP 1*VCHAR SP 1*VCHAR
 
-c-edge-connects = "edge_connects" SP eid SP vid SP vid
-c-parent        = "parent" SP nid SP nid
-c-group-id      = "group_id" SP uint32 SP uint16
-c-above         = "above" SP uint32 SP uint32
-c-contains      = "contains" SP uint32 SP uint32
-c-state-machine = "state_machine" SP uint16 SP uint16 SP *(transition)
-transition      = uint16 SP trigger-type SP number
-trigger-type    = "time" / "event" / "condition"
-c-disjunction   = "disjunction" SP 2*(cid)
-c-bound-check   = "bound_check" SP uint32 SP dim SP number SP number
-c-xor           = "xor" SP cid SP cid
-c-implication   = "implication" SP cid SP cid
-dim             = "x" / "y"
-
-; LP
-lp-constraint   = c-min-dist / c-diffusion / c-linear-eq / c-linear-le
-                / c-linear-ge / c-bbox-clamp / c-collision-free
-                / c-flow-conservation
-
-c-min-dist        = "min_dist" SP uint32 SP uint32 SP number
-c-diffusion       = "diffusion" SP eid SP "L" SP hexcolor SP "R" SP hexcolor
-c-linear-eq       = "linear_eq" SP number SP *(variable-term)
-c-linear-le       = "linear_le" SP number SP *(variable-term)
-c-linear-ge       = "linear_ge" SP number SP *(variable-term)
-variable-term     = uint32 SP number    ; variable_id coefficient
-c-bbox-clamp      = "bbox_clamp" SP uint32 SP number SP number SP number SP number
-c-collision-free  = "collision_free" SP sid SP sid SP number
-c-flow-conservation = "flow_conservation" SP uint32 SP number
-
-; QP
-qp-constraint   = c-min-curvature / c-min-stretch / c-ik-target
-                / c-fair-blend / c-cage-deform
-
-c-min-curvature = "min_curvature" SP cid SP number
-c-min-stretch   = "min_stretch" SP nid SP number
-c-ik-target     = "ik_target" SP uint32 SP number SP number SP number
-c-fair-blend    = "fair_blend" SP *(uint32)
-c-cage-deform   = "cage_deform" SP uint32 SP number
-
-; ── Metadata ────────────────────────────────────────────────────────
-
-meta           = "m" SP 1*VCHAR SP 1*VCHAR
-
-; ── Terminals ───────────────────────────────────────────────────────
-
-vid            = uint16          ; vertex ID
-eid            = uint16          ; edge ID
-fid            = uint16          ; face ID
-sid            = uint16          ; stroke ID
-cid            = uint16          ; curve ID or constraint ID
-nid            = uint16          ; node ID
-flags          = uint32
-uint16         = 1*5DIGIT        ; 0-65535
-uint32         = 1*10DIGIT       ; 0-4294967295
-number         = ["-"] 1*DIGIT ["." 1*6DIGIT]   ; decimal fixed-point literal
-hexcolor       = 6*8HEXDIG       ; RRGGBB or RRGGBBAA
-
-SP             = " "
-DIGIT          = %x30-39
-HEXDIG         = DIGIT / "A" / "B" / "C" / "D" / "E" / "F"
-                  / "a" / "b" / "c" / "d" / "e" / "f"
-VCHAR          = %x21-7E
+vid / eid / fid / sid / cid / nid / aid / pid = uint16
+uint16       = 1*5DIGIT        ; 0-65535
+uint32       = 1*10DIGIT       ; 0-4294967295
+number       = ["-"] 1*DIGIT ["." 1*6DIGIT]
+hexcolor     = 3HEXDIG / 6HEXDIG / 8HEXDIG   ; RGB / RRGGBB / RRGGBBAA
 ```
 
 ---
@@ -691,15 +668,19 @@ VCHAR          = %x21-7E
 
 | Profile | ID | Mandatory Features | Forbidden Features |
 |---|---|---|---|
-| **Full** | 0 | All primitives, all constraint types, SMT+LP+QP | None |
-| **Web-Safe** | 1 | Vertices, edges, faces, strokes, nodes. LP constraints only. Q16.16. | SMT, QP, analytic AST, diffusion curves |
-| **Print-PDF** | 2 | Vertices, edges, faces, strokes. LP + QP. Q32.32. | Animation, state machines, analytic AST |
-| **CAD-Exact** | 3 | All primitives. SMT + LP. Q32.32. No saturation (exact arithmetic via Q64.64 extension). | Animation, QP, analytic AST |
-| **Anime-Production** | 4 | All primitives. All solvers. Q16.16. Full animation + rigging. | None |
+| **Full** | 0 | All primitives, all sections, LP + convex QP | None |
+| **Web-Safe** | 1 | Vertices, edges, faces, strokes, nodes, arcs, ellipses. LP only. Q16.16. | QP, state machines, diffusion |
+| **Print-PDF** | 2 | Vertices, edges, faces, strokes, nodes. LP + QP. Q32.32. | State machines, diffusion |
+| **CAD-Exact** | 3 | All primitives. LP only. Q32.32. No saturation (Q64.64 extension). | QP, state machines |
+| **Anime-Production** | 4 | All primitives, all sections, LP + QP + state machines + diffusion. Q16.16. | None |
 
 ### 8.2 Conformance
 
-A reader **must** reject files that use features outside the declared profile (or the reader's supported profile set). The `PROFILE_ID` in the header's `solver_config` field indicates the file's profile.
+A reader **must** reject files that use features outside the declared profile
+(or the reader's supported profile set). The `PROFILE_ID` in the header's
+`solver_config` field indicates the file's profile. A v1.3 reference reader is
+permitted to **warn-and-drop** malformed records it cannot honour (see §9.2)
+instead of rejecting the whole file, provided it reports the drop.
 
 ---
 
@@ -707,34 +688,37 @@ A reader **must** reject files that use features outside the declared profile (o
 
 ### 9.1 Document Limits
 
-| Parameter | Maximum | Enforced By |
+| Parameter | Spec maximum | Reference rasterizer (enforced) |
 |---|---|---|
-| Vertices | 65535 | uint16 ID space |
-| Edges | 65535 | uint16 ID space |
-| Faces | 65535 | uint16 ID space |
-| Strokes | 65535 | uint16 ID space |
-| Constraints | 65535 | uint16 ID space |
-| AST depth | 32 | Parser rejection |
-| AST nodes | 256 per blob | Parser rejection |
-| State machine states | 256 | Parser rejection |
-| State machine transitions | 1024 | Parser rejection |
-| Payload section | 16 MB | Header-declared limit |
-| Solver iterations | 255 (MAX_ITER) | Header `solver_config` |
-| Solver wall time | 255 ms (MAX_MS) | Header `solver_config` |
-| Face edge count | 1024 | Parser rejection |
-| Stroke control points | 4096 | Parser rejection |
+| Vertices | 65535 | 4096 |
+| Edges | 65535 | 4096 |
+| Faces | 65535 | 4096 |
+| Strokes | 65535 | 4096 |
+| Nodes | 65535 | 1024 |
+| Arcs / Ellipses | 65535 | 256 |
+| Constraints per section (s/a/c) | 65535 | 256 |
+| Paint records (p) | 65535 | 128 |
+| Stroke width samples | 4096 | 64 |
+| Face edge count | 1024 | 64 |
+| State machine states | 256 | 256 |
+| Solver iterations | 255 (MAX_ITER) | 64 |
+| Solver wall time | 255 ms (MAX_MS) | 50 ms |
+| Payload section | 16 MB | — |
 
 ### 9.2 Malformed Input Handling
 
-| Condition | Action |
-|---|---|
-| Unknown type tag | Reject file (fatal parse error) |
-| ID out of range | Reject file |
-| Self-referential edge (v_start == v_end) | Warn, skip edge |
-| Cyclic parent with no convergence after MAX_ITER | Use last values, flag warning |
-| CRC mismatch | Reject file |
-| Payload size exceeds 16 MB | Reject file |
-| AST depth exceeds 32 | Reject file |
+| Condition | v1.1 behavior | v1.3 reference behavior |
+|---|---|---|
+| Unknown type tag / command | Reject file | Warn, skip line |
+| ID out of range (huge or negative) | **OOB write → memory corruption** | **Warn, ignore record** (bounds-checked before any write) |
+| Edge endpoint references missing vertex | Crash (OOB read) | Warn, drop edge (post-parse validation pass) |
+| Face references invalid edge | Crash | Warn, drop face fill |
+| Stroke references invalid edge | Crash | Warn, drop stroke |
+| Constraint section overflow | Silent buffer overflow | Warn, ignore excess records |
+| Self-referential edge (v_start == v_end) | — | Accepted (renders as a point) |
+| Face boundary not a closed chain | Wrong fill | Warn, skip fill |
+| Non-convex QP | Runtime hazard | Parse error (spec-level) |
+| CRC mismatch | Reject file | Reject file (container level) |
 
 ### 9.3 No External References
 
@@ -755,10 +739,57 @@ The format **bans** all external references:
 5. **TinyVG** — Compact binary vector graphics. `https://tinyvg.tech`
 6. **Zstandard** — Fast compression algorithm. RFC 8878.
 7. **Q16.16 Fixed-Point** — ARM Architecture Reference Manual, Section A2.5.
-8. **SMT-LIB v2** — Standard for SMT solvers. `http://smt-lib.org`
+8. **Orzan et al.** — Diffusion curves: A vector representation for smooth-shaded images. SIGGRAPH 2008.
 9. **Goldfarb-Reid** — Steepest-edge simplex pricing. Mathematical Programming 75 (1996).
-10. **Euler-Elastica** — Curve energy minimization. L. Euler, *Methodus Inveniendi Lineas Curvas*, 1744.
+10. **Euler-Elastica** — Curve energy minimization. L. Euler, 1744.
 
 ---
 
-*End of SmazkaVG v1.1 Formal Specification*
+## 11. v1.2 / v1.3 Amendment Summary & Future Work
+
+### 11.1 Known Limitations (honest)
+
+- **Diffusion** is a signed-distance brush, not a cotangent-Laplacian PDE solve.
+- **min_dist / collision_free** use SLP; exact L2 needs SOCP/MIP.
+- **Stroke joins** (miter/round/bevel) and **dash arrays** are not implemented.
+- **Holes** in faces (`n_holes`) are specified in the binary layout but not
+  exposed in Line-ASM v1.3.
+- **Text** is banned (converted to paths).
+- The **binary container** is specified but the shipped tooling is a compact
+  delta-VLQ reference implementation (§11.2); the full CRC-protected container
+  is future work.
+
+### 11.2 Compact Reference Container (tools/)
+
+`tools/smazka-bin` converts Line-ASM ⇄ a compact binary container:
+
+- Header: magic `SMVG`, version 1.3, flags, per-section counts.
+- IDs and coordinates are **variable-length zigzag VLQs** (LEB128-style).
+- Coordinates are **delta-encoded** relative to the previous record of the same
+  type (dx, dy), giving typical savings of 3–6× versus raw Q16.16 words.
+- Round-trips losslessly: `smazka-line2bin x.smazka > x.smvg && smazka-bin2line x.smvg` reproduces the document.
+
+### 11.3 Code-Golf Dialect (tools/smazka-golf)
+
+The golf dialect targets byte-starved generative environments (Vyxal, Canvas,
+Charcoal). It is a *superset* compiler: every `.sg` file expands to canonical
+Line-ASM before rendering.
+
+| Construct | Example | Expands to |
+|---|---|---|
+| Implicit vertex IDs | `v 10 20` | `v 0 10 20` |
+| Relative deltas | `+ 5 0` | `v 1 15 20` |
+| Polygon (auto edges+face) | `P 0 0 100 0 50 86` | 3 `v`, 3 `e`, 1 `f` |
+| Rectangle | `R 0 0 100 50` | 4 `v`, 4 `e`, 1 `f` |
+| Circle (4 cubics) | `C 50 50 30` | 4 `v`, 4 `e type=cubic`, 1 `f` |
+| Stroke | `S 0 blue 3` | `s 0 0 0000FF 3` |
+| Mirror | `M x 0 1 2` | duplicates vertices with negated x |
+| Palette colors | `red`, `#f00` | `FF0000` / `F00` hex |
+
+This addresses the audit findings on golfability: IDs are implicit (45%+ of a
+naive file is ID bookkeeping), shape primitives are one token, colors compress
+to 1–3 bytes, and symmetry needs no manual duplication.
+
+---
+
+*End of SmazkaVG v1.3 Formal Specification*
