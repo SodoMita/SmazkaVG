@@ -90,7 +90,10 @@ junctions, and use `fit_report` locally instead of global re-snapping.
 ### 1.9 Coordinates are source-image pixels — pin the view
 `author.Doc(W, H)` uses the source image's pixel grid 1:1. When rendering
 `.smazka` with the C rasterizer, always pass `--view 0 0 1`, otherwise it
-auto-fits with a 50 px margin and your comparison metric lies to you.
+auto-fits with a 50 px margin and your comparison metric lies to you —
+a full-figure document at native canvas size comes out ~5 % small and
+~40 px off, halving a tol-6 score while *looking* fine (v1.6.3+ prints the
+applied auto-fit transform once per run; heed it).
 (When authoring interactively with debug guides, `--debug-overlay` re-enables
 raw edge guides + red vertex markers; those marks used to be baked into every
 output, which is why old example PNGs look dotty.)
@@ -280,3 +283,48 @@ record in the `.smazka` → `--xpand` lint → render `--view 0 0 1` →
 `verify.run` → next worst tile. Numeric ids are fine to mix in (supplement
 automation), just keep them above the name counters; redefinitions are now
 hard errors, not silent overwrites.
+
+---
+
+## 9. Audit: constraints that show the garbage (v1.6.3)
+
+`verify` answers "how close is the render" (one number); **audit** answers
+"which records are lying" (a per-stroke charge sheet):
+
+```sh
+PYTHONPATH=tools python3 -m llm.audit drawing.smazka \
+    --src original.jpg --tol 6 \
+    --overlay audit_overlay.smazka --report audit.txt
+build/smazka-raster audit_overlay.smazka 1350 2268 --view 0 0 1
+```
+
+Charge sheet:
+
+- **stray** (red) — ink with no source under it within `--tol`. Re-anchor
+  it from `imgscan` runs or retire it. A stray stroke is authored
+  imagination; it is also how +2 pp of false metric gets cleaned.
+- **hidden** (blue) — every inked pixel covered by a later opaque face in
+  your own z-order. Sometimes doctrine (occluded board edge under an arm
+  fill); sometimes a z-order bug. It is a review queue, not a conviction.
+- **dup** (magenta) — two records painting the same line. Merge them;
+  dups render as fake-bold.
+- **join** (orange) — endpoints hovering near vertices they missed. Fix by
+  retyping the exact coordinate or by splicing with `use/rev` (§8), never
+  by nudging "close enough".
+- **degen** — collapsed spans (duplicate consecutive points).
+
+Rules of engagement:
+
+1. **Don't argue with stray.** Measure the zone (`§2`), and either the
+   source run exists (re-anchor, exact coords) or it doesn't (delete).
+2. **Overlay first, then edit.** The overlay is a `.smazka` of the
+   findings themselves — render it pinned (`--view 0 0 1`) and read the
+   colors off the source, crop-zoomed. The `.txt` is for ordering
+   (worst-first), the overlay is for *seeing*.
+3. **Audit after every batch of edits**, before committing. Regression
+   direction is more important than the absolute count: claims deleted
+   should never come back silently.
+4. Pair with `fobj … sw=0` + explicit `path` boundary strokes (§8): the
+   default "stroke the whole loop" paints phantom ink wherever the source
+   merges two objects into one line (an arm crossing a board edge, scarf
+   over sleeve). sw=0 makes the fill honest; paths claim only real ink.

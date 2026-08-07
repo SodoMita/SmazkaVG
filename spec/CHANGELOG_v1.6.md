@@ -113,3 +113,58 @@ The `.smazka` file itself is now the hand-editable artifact: a sugar layer
 - `MAX_FE` 512 → 1024 (tessellated body loops exceed 512 boundary edges);
   e/f/s numeric heads now bump their namespace counters (latent collision
   with chain-minted ids); test script links `smazka-bin` with `-lm`.
+
+---
+
+# v1.6.3 — audit: constraints that SHOW the garbage (llm-vectorization)
+
+The authoring skin made the document editable; this release makes it
+*accountable*. A vectorization document is a claim ("there is ink here,
+of this width, owned by this object"); claims need constraints that
+rat out violations instead of silently absorbing them.
+
+## Added
+
+- **`tools/llm/audit.py` — the garbage detector.** XPands the document,
+  attributes every stroke back to its named record via the `# |` echoes,
+  then checks each stroke against the *source image* and the *document's
+  own z-order*:
+  - **stray** — rendered ink whose distance to the nearest source ink
+    exceeds the tolerance (phantom strokes; distance field on the source).
+  - **hidden** — strokes fully covered by a later opaque face in the
+    document's own paint order (dead ink: authored, paid for, invisible).
+  - **dup** — stroke pairs whose resampled polylines shadow each other
+    (mean < 1.5 px, max < 4 px): two claims for one line.
+  - **join** — stroke endpoints hovering within striking distance
+    (0.75–3.5 px) of a vertex they failed to land on: seam drift.
+  - **degen** — duplicate consecutive points and other collapsed spans.
+  Emits a text report *and* an `overlay.smazka` that paints the findings
+  in place (red stray / magenta dup / blue hidden / orange join, over a
+  gray ghost of the drawing) — render it and LOOK, don't read tea leaves.
+  On the 1350×2268 surfer the first baseline found 66 stray (one ~1400 px
+  phantom arm cluster ~61 px off-source), 20 dups and 5 degens; fixing
+  what it showed moved tol-6 precision/coverage from .8045/.8371 to
+  .8508/.8576.
+
+- **Seam edges are never stroked (ns flags).** `useg|revg` ghost splices
+  and auto-bridged seam joints are marked "no-stroke" in `XaChain` and
+  skipped by `xa_strokes` — a wrist chord no longer paints across the palm
+  when the boundary walks through it.
+
+- **Auto-fit now announces itself.** Rendering without `--view` auto-fits
+  with a ~50 px margin; for a document authored in image pixels that is a
+  silent ~5 % scale+offset lying to every pixel-distance check (and to
+  `verify`). The rasterizer prints the applied transform once per run and
+  points at `--view 0 0 1`. (AGENTS.md §1.9 has mandated the pinned view
+  since v1.6; now the tool itself says so when you forget.)
+
+## Doctrine notes (consumed by audit, worth restating)
+
+- **Fill-only silhouettes + explicit ink runs.** `fobj … sw=0` plus named
+  `path` strokes for exactly the boundary runs the source *inks* — the
+  default `sw>0` outline claims ink along the *whole* loop, which is a lie
+  on every occluded/merged run. sw=0 + paths = no phantom hugs.
+- **A stroke is a claim on the source.** If you cannot point at the source
+  run (`imgscan.row_runs/col_runs`) it paints, expect it in next audit's
+  stray list. If it is intentionally occluded, expect it in hidden —
+  hidden is a *review queue*, not an error.

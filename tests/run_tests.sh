@@ -417,7 +417,7 @@ probe('blob fill FFEEDD interior', r > 250 and 225 <= g <= 245 and 205 <= b2 <= 
 probe('blob outline ink at (260,56)', px(a, 260, 56).sum() < 600)
 r, g, b2 = px(a, 150, 176)
 probe('halo fill FFCCCC interior', r > 250 and g < 220 and b2 < 220)
-probe('tail boundary ink at (60,85)', px(a, 60, 85).sum() < 400)
+probe('seam ghost edge unstoked, tail real edge inks at (75,95)', px(a, 75, 95).sum() < 400)
 r, g, b2 = px(a, 410, 200)
 probe('numeric-mix orange stroke FF8800', r > 200 and 90 <= g <= 170)
 probe('paper stays white at (10,10)', px(a, 10, 10).sum() > 740)

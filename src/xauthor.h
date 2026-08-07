@@ -227,18 +227,23 @@ static int xa_pt(const char *t, double *x, double *y) {
 
 /* ---------------- chain builder (path/fobj) ---------------- */
 typedef struct {
-    int *e; int n, cap;
+    int *e; unsigned char *ns; int n, cap;   /* ns: edge is an internal seam (no stroke) */
     int started, v_first, v_last;
     double x0, y0, x1, y1;
 } XaChain;
 
-static void xa_push(XaChain *c, int eid) {
+static void xa_pushm(XaChain *c, int eid, int nstk) {
     if (c->n == c->cap) {
         c->cap = c->cap ? c->cap * 2 : 32;
         c->e = realloc(c->e, (size_t)c->cap * sizeof(int));
+        c->ns = realloc(c->ns, (size_t)c->cap * sizeof(unsigned char));
     }
-    c->e[c->n++] = eid;
+    c->e[c->n] = eid; c->ns[c->n] = (unsigned char)nstk; c->n++;
 }
+
+static void xa_push(XaChain *c, int eid) { xa_pushm(c, eid, 0); }
+
+
 
 static void xa_adopt(XaChain *c, int v, double x, double y) {
     c->started = 1; c->v_first = v; c->x0 = x; c->y0 = y;
@@ -282,7 +287,7 @@ static int xa_chain(Xa *xa, char **it, int nit, const char *etype, int closed,
                 if (xa_join(xa, c, sx, sy, sv) != 0) continue;
                 for (int k = 0; k < sp->ne; k++) {
                     int e = mode == 1 ? sp->elist[k] : sp->elist[sp->ne - 1 - k];
-                    xa_push(c, e);
+                    xa_pushm(c, e, 1);          /* seam: belongs to neighbor, never stroked here */
                 }
                 c->v_last = mode == 1 ? sp->v_last : sp->v_first;
                 c->x1 = mode == 1 ? sp->x1 : sp->x0;
@@ -298,7 +303,7 @@ static int xa_chain(Xa *xa, char **it, int nit, const char *etype, int closed,
                         fprintf(xa->err, "xa: line %d: warning: ghost seam gap %.2fpx bridged\n",
                                 xa->lineno, d);
                         int nv = xa_new_vert(xa, sx, sy);
-                        xa_push(c, xa_new_edge(xa, c->v_last, nv, "seg"));
+                        xa_pushm(c, xa_new_edge(xa, c->v_last, nv, "seg"), 1);
                         c->v_last = nv; c->x1 = sx; c->y1 = sy;
                     }
                 }
@@ -317,7 +322,7 @@ static int xa_chain(Xa *xa, char **it, int nit, const char *etype, int closed,
                         continue;
                     }
                     int nv = xa_new_vert(xa, fx, fy);
-                    xa_push(c, xa_new_edge(xa, c->v_last, nv, "seg"));
+                    xa_pushm(c, xa_new_edge(xa, c->v_last, nv, "seg"), 1);
                     c->v_last = nv; c->x1 = fx; c->y1 = fy;
                 }
             }
@@ -342,6 +347,7 @@ static int xa_chain(Xa *xa, char **it, int nit, const char *etype, int closed,
 static void xa_strokes(Xa *xa, XaChain *c, double w, const char *color,
                        const char *cap) {
     for (int i = 0; i < c->n; i++) {
+        if (c->ns && c->ns[i]) continue;        /* seam edges stay invisible */
         int id = xa->cnt[XA_S]++;
         xa_mark(xa, XA_S, id);
         xa_put(xa, "s %d %d %s %.2f %.2f cap=%s\n", id, c->e[i],
@@ -378,6 +384,7 @@ static void xa_record_path(Xa *xa, char **tv, int nt) {
     xa_chain(xa, tv + i, nt - i, etype, closed, &c);
     xa_register_path(xa, tv[1], &c);
     if (w > 0) xa_strokes(xa, &c, w, color, cap);
+    free(c.ns);
     xa_put(xa, "# path %s (edges %d%s)\n", tv[1], c.n, closed ? ", closed" : "");
 }
 
@@ -411,9 +418,10 @@ static void xa_record_fobj(Xa *xa, char **tv, int nt) {
             xa_put(xa, "s %d group_id %d %d\n", gid, fid, xa->group);
         }
         if (sw > 0) { char col[16] = "000000"; xa_strokes(xa, &c, sw, col, cap); }
+        free(c.ns);
     } else {
         xa_err(xa, "fobj '%s': fewer than 3 edges, no face emitted", tv[1]);
-        free(c.e);
+        free(c.e); free(c.ns);
     }
     xa_put(xa, "# fobj %s\n", tv[1]);
 }

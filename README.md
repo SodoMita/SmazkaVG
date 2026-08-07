@@ -61,6 +61,7 @@ SmazkaVG/
 │   ├── imgscan.py                     #   measure the source raster (runs, ascii, probes)
 │   ├── author.py                      #   dot-first strokes/objects -> .smazka + preview .svg
 │   ├── verify.py                      #   precision/coverage metric + red/blue overlays
+│   ├── audit.py                       #   per-stroke garbage report: stray/hidden/dup/join/degen + overlay
 │   ├── geometry.py                    #   catmull/polyline tessellation, chains, trimming
 │   └── selftest.py                    #   toolkit unit tests
 └── tests/

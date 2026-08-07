@@ -1279,6 +1279,7 @@ static void draw_ellipse(int ei) {
 /* ── View fit ─── */
 static int view_fixed = 0;
 static double fix_ox, fix_oy, fix_sc;
+static int g_view_warned = 0;   /* v1.6.3: warn once when auto-fit silently transforms */
 
 static void view(double *ox, double *oy, double *sc) {
     if (view_fixed) { *ox = fix_ox; *oy = fix_oy; *sc = fix_sc; return; }
@@ -1323,6 +1324,19 @@ static void view(double *ox, double *oy, double *sc) {
     *sc = fmin(sx, sy);
     *ox = m - mnx * (*sc) + ((FW - 2 * m) - sw * (*sc)) * 0.5;
     *oy = m - mny * (*sc) + ((FH - 2 * m) - sh * (*sc)) * 0.5;
+    /* v1.6.3: surface the silent transform. A document authored in image
+       pixels is garbage-checked in document coordinates; if auto-fit then
+       rescales it behind the author's back, every pixel-distance constraint
+       (audit tolerances, seam gaps, duplicate radii) reads wrong. Say so. */
+    if (!g_view_warned && (fabs(*sc - 1.0) > 0.005 || fabs(*ox) > 1.0 || fabs(*oy) > 1.0)) {
+        g_view_warned = 1;
+        fprintf(stderr,
+            "smazka: note: auto-fit view applied scale=%.4f offset=(%.1f,%.1f): "
+            "%.0fx%.0f document on %dx%d canvas;\n"
+            "        if document coords are image pixels (vectorization work), "
+            "render with --view 0 0 1 for pixel-exact output\n",
+            *sc, *ox, *oy, sw, sh, FW, FH);
+    }
 }
 static void bbox_pt(V2 p, double *mnx, double *mny, double *mxx, double *mxy) {
     if (p.x < *mnx) *mnx = p.x;
