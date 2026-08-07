@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 480" width="640" height="480">
+  <!-- SmazkaVG v1.2 SVG projection -->
+  <rect width="640" height="480" fill="white"/>
+  <g id="face-0"><polygon points="99.07,50.00 540.93,50.00 320.00,430.00 " fill="rgba(240,240,255,1.00)"/></g>
+  <line id="e0" x1="99.07" y1="50.00" x2="540.93" y2="50.00" stroke="#282828" stroke-width="1.5"/>
+  <path id="e1" d="M 540.93,50.00 C 107.91,403.49 231.63,315.12 320.00,430.00" stroke="#282828" stroke-width="1.5" fill="none"/>
+  <line id="e2" x1="99.07" y1="50.00" x2="320.00" y2="430.00" stroke="#282828" stroke-width="1.5"/>
+  <line id="s0" x1="99.07" y1="50.00" x2="540.93" y2="50.00" stroke="rgba(0,0,255,1.00)" stroke-width="13.26" stroke-linecap="round"/>
+  <path id="s1" d="M 540.93,50.00 C 107.91,403.49 231.63,315.12 320.00,430.00" stroke="rgba(255,0,0,1.00)" stroke-width="8.84" stroke-linecap="round" fill="none"/>
+  <circle id="v0" cx="99.07" cy="50.00" r="3" fill="#dc3232"/>
+  <circle id="v1" cx="540.93" cy="50.00" r="3" fill="#dc3232"/>
+  <circle id="v2" cx="320.00" cy="430.00" r="3" fill="#dc3232"/>
+</svg>
