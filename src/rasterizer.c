@@ -20,11 +20,16 @@
  *    triangles for non-fan polygons).
  *  - Strokes honour the full taper profile: width is now a function of the
  *    edge parameter t (previously the profile was averaged to a single width).
- *  - Diffusion is a signed-distance curve brush that follows curved spines
- *    (previously a straight-line-only perpendicular gradient).
+ *  - Diffusion is a discrete Laplace (Poisson) solve with SOR relaxation:
+ *    left/right Dirichlet colors on the curve, region border held at the
+ *    artwork, so the field follows curved spines and diffuses smoothly
+ *    (v1.3 was a signed-distance brush; v1.1 had only a straight-line
+ *    gradient).
  *  - Catmull-Rom edges are converted to cubic Béziers once per frame (the old
  *    per-pixel code re-searched the edge table inside a 65-sample loop).
  *  - WebP export no longer shells out through system(): fork/exec only.
+ *  - PNG export is fully self-contained (stored-deflate zlib stream,
+ *    CRC-32 + ADLER-32) with no external dependencies.
  *
  * Build: cc -O2 -Wall -Wextra -o smazka-raster src/rasterizer.c -lm
  */
@@ -86,7 +91,7 @@ typedef struct { int eids[MAX_FE]; int ne; uint32_t fill; } Face;
 static Face faces[MAX_F];
 
 static int n_s;
-static struct { int eid; Col c; double w[MAX_W]; int nw; } strokes[MAX_S];
+static struct { int eid; Col c; double w[MAX_W]; int nw; int cap; } strokes[MAX_S];  /* cap: 0=round 1=butt 2=square */
 
 static int n_n;
 static struct { double tx, ty, rot, sx, sy, skew; int cref; } nodes[MAX_N];
@@ -234,9 +239,16 @@ static int parse(const char *path) {
                 if (sscanf(p, "s %d %d %31s", &id, &eid, cstr) < 3) break;
                 if (!id_ok(id, MAX_S)) { warn("line %d: s: id %d out of range [0,%d); ignored\n", lineno, id, MAX_S); break; }
                 if (id >= n_s) n_s = id + 1;
-                strokes[id].eid = eid; strokes[id].c = col(cstr); strokes[id].nw = 0;
+                strokes[id].eid = eid; strokes[id].c = col(cstr); strokes[id].nw = 0; strokes[id].cap = 0;
                 const char *t = p; for (int i = 0; i < 4; i++) skip_token(&t);
                 while (*t && *t != '#') {
+                    while (*t == ' ' || *t == '\t') t++;
+                    if (strncmp(t, "cap=", 4) == 0) {      /* cap may follow the widths */
+                        if (strncmp(t + 4, "butt", 4) == 0) strokes[id].cap = 1;
+                        else if (strncmp(t + 4, "square", 6) == 0) strokes[id].cap = 2;
+                        else strokes[id].cap = 0;
+                        break;
+                    }
                     double w; int n;
                     if (sscanf(t, "%lf%n", &w, &n) == 1 && n > 0) {
                         if (strokes[id].nw < MAX_W) strokes[id].w[strokes[id].nw++] = w;
@@ -818,7 +830,7 @@ static double width_at(double *w, int nw, double t) {
     return w[i0] * (1 - f) + w[i0 + 1] * f;
 }
 
-static void stroke_edge_perpixel(int eid, double *widths, int nw, Col c, double scale) {
+static void stroke_edge_perpixel(int eid, double *widths, int nw, Col c, double scale, int cap) {
     if (!id_ok(eid, n_e) || ss_edges[eid].v0 < 0) return;
 
     double maxw = 2.0;
@@ -844,8 +856,48 @@ static void stroke_edge_perpixel(int eid, double *widths, int nw, Col c, double 
         for (int x = x0; x <= x1; x++) {
             V2 P = { x + 0.5, y + 0.5 };
             double t = 0;
-            double d = dist_to_edge_t(P, eid, &t);
-            double hw = width_at(widths, nw, t) * scale * 0.5;
+            double d = dist_to_edge_t(P, eid, &t);   /* distance, t clamped */
+            double tc = t; if (tc < 0) tc = 0; if (tc > 1) tc = 1;
+            double hw = width_at(widths, nw, tc) * scale * 0.5;
+
+            /* Cap handling. dist_to_edge_t clamps t, so a pixel "beyond" an
+               endpoint is detected by projecting onto the endpoint tangents.
+               - round:  distance to the endpoint point (half-disk)
+               - butt:   nothing beyond the endpoint (flat cut)
+               - square: rectangle of width 2*hw_e extending hw_e along the
+                         tangent (perpendicular distance, capped tangentially) */
+            V2 T0 = eval_edge_d1(eid, 0.0);
+            V2 T1 = eval_edge_d1(eid, 1.0);
+            double l0 = sqrt(T0.x * T0.x + T0.y * T0.y);
+            double l1 = sqrt(T1.x * T1.x + T1.y * T1.y);
+            int beyond0 = (l0 > 1e-9) && (T0.x * (P.x - p0.x) + T0.y * (P.y - p0.y)) / l0 < 0;
+            int beyond1 = (l1 > 1e-9) && (T1.x * (P.x - p3.x) + T1.y * (P.y - p3.y)) / l1 > 0;
+            if (beyond0 || beyond1) {
+                int is_start = beyond0;
+                V2 E = is_start ? p0 : p3;
+                V2 T = is_start ? T0 : T1;
+                double tl = sqrt(T.x * T.x + T.y * T.y);
+                double hw_e = width_at(widths, nw, is_start ? 0.0 : 1.0) * scale * 0.5;
+                if (tl < 1e-9) {   /* degenerate endpoint: round disk */
+                    d = sqrt((P.x - E.x) * (P.x - E.x) + (P.y - E.y) * (P.y - E.y));
+                    hw = hw_e;
+                } else {
+                    double dtan = is_start
+                        ? -((P.x - E.x) * T.x + (P.y - E.y) * T.y) / tl
+                        :  ((P.x - E.x) * T.x + (P.y - E.y) * T.y) / tl;
+                    double dperp = fabs(((P.x - E.x) * T.y - (P.y - E.y) * T.x)) / tl;
+                    if (cap == 0) {
+                        d = sqrt((P.x - E.x) * (P.x - E.x) + (P.y - E.y) * (P.y - E.y));
+                        hw = hw_e;
+                    } else if (cap == 1) {
+                        d = 1e30;              /* butt: nothing beyond */
+                    } else {                   /* square */
+                        if (dtan >= 0 && dtan <= hw_e) { d = dperp; hw = hw_e; }
+                        else d = 1e30;
+                    }
+                }
+            }
+
             if (d <= hw + 0.75) {
                 double alpha;
                 if (d <= hw - 0.75) alpha = 1.0;
@@ -856,7 +908,6 @@ static void stroke_edge_perpixel(int eid, double *widths, int nw, Col c, double 
         }
     }
 }
-
 /* ─── Arc rendering ─── */
 static void draw_arc(int ai) {
     Arc *a = &arcs[ai];
@@ -966,17 +1017,24 @@ static void view(double *ox, double *oy, double *sc) {
     *oy = m - mny * (*sc) + ((FH - 2 * m) - sh * (*sc)) * 0.5;
 }
 
-/* ─── Diffusion (signed-distance curve brush) ───
-   For every pixel within `rad` of the diffusion edge, the color is a blend of
-   left/right colors across the *signed* distance from the curve's closest
-   point, so the brush follows curved spines. This is an approximation of
-   Orzan et al. diffusion curves; a full cotangent-Laplacian PDE solve is
-   future work (see SPEC.md). */
+/* ─── Diffusion curves (discrete Laplace / Poisson solve) ───
+   For each `p diffusion` record we solve the Laplace equation over the
+   framebuffer region around the curve:
+       ∇²c = 0
+   with Dirichlet boundary conditions c = left_color on one side of the
+   curve and c = right_color on the other, and the region border held at the
+   existing framebuffer content, so the field diffuses smoothly into the
+   artwork.  Solved by successive over-relaxation (SOR) with bounded,
+   deterministic iterations (SPEC §5.6.1).  This is the Orzan et al.
+   diffusion-curves model discretized per pixel: it follows curved spines
+   and produces smooth fields, replacing the v1.3 perpendicular-gradient
+   brush. */
 static void draw_diffusion(int pi) {
     int eid = pcon[pi].tgt;
     if (!id_ok(eid, n_e) || ss_edges[eid].v0 < 0) return;
     V2 a = ss_verts[ss_edges[eid].v0], b = ss_verts[ss_edges[eid].v1];
-    double rad = 50 * ((double)FW / 512.0);   /* ~50px at 512-wide view */
+    double rad = 60 * ((double)FW / 512.0);   /* ~60px at 512-wide view */
+    if (rad > 150) rad = 150;                  /* bound the solve region */
     double pad = rad + 2;
     int x0 = (int)floor(fmin(a.x, b.x) - pad), x1 = (int)ceil(fmax(a.x, b.x) + pad);
     int y0 = (int)floor(fmin(a.y, b.y) - pad), y1 = (int)ceil(fmax(a.y, b.y) + pad);
@@ -991,29 +1049,98 @@ static void draw_diffusion(int pi) {
     if (x1 >= FW) x1 = FW - 1;
     if (y0 < 0) y0 = 0;
     if (y1 >= FH) y1 = FH - 1;
+    int W = x1 - x0 + 1, H = y1 - y0 + 1;
+    if (W < 3 || H < 3) return;
+    long area = (long)W * H;
+    if (area > 900000L) return;               /* bounded computation */
+
     Col lc = pcon[pi].c1, rc = pcon[pi].c2;
-    for (int y = y0; y <= y1; y++) {
-        for (int x = x0; x <= x1; x++) {
-            V2 P = { x + 0.5, y + 0.5 };
-            double t = 0;
-            double d = dist_to_edge_t(P, eid, &t);
-            if (t < -0.05 || t > 1.05 || d > rad) continue;
-            /* signed side: cross product of (tangent, P - closest) */
-            V2 Q = eval_edge(eid, t);
-            V2 T = eval_edge_d1(eid, t);
-            double tl = sqrt(T.x * T.x + T.y * T.y);
-            if (tl < 1e-9) continue;
-            double side = ((P.x - Q.x) * T.y - (P.y - Q.y) * T.x) / tl;
-            double bl = 0.5 + side / (2.0 * rad);
-            if (bl < 0) bl = 0;
-            if (bl > 1) bl = 1;
-            double fo = 1.0 - d / rad;
-            uint8_t r = (uint8_t)(lc.r * (1 - bl) + rc.r * bl);
-            uint8_t g = (uint8_t)(lc.g * (1 - bl) + rc.g * bl);
-            uint8_t b = (uint8_t)(lc.b * (1 - bl) + rc.b * bl);
-            fb_blend(x, y, r, g, b, (uint8_t)(fo * 180));
+    float *R = (float *)malloc((size_t)area * sizeof(float));
+    float *G = (float *)malloc((size_t)area * sizeof(float));
+    float *B = (float *)malloc((size_t)area * sizeof(float));
+    uint8_t *fixed = (uint8_t *)malloc((size_t)area);
+    if (!R || !G || !B || !fixed) { free(R); free(G); free(B); free(fixed); return; }
+
+    /* init from the framebuffer (region border = artwork = Neumann-free BC) */
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            int o = ((y0 + y) * FW + (x0 + x)) * 3;
+            int idx = y * W + x;
+            R[idx] = fb[o];
+            G[idx] = fb[o + 1];
+            B[idx] = fb[o + 2];
         }
     }
+    memset(fixed, 0, (size_t)area);
+
+    /* Dirichlet: paint left/right colors onto pixels within ~2.5px of the
+       curve, classified by the sign of the tangent cross product */
+    {
+        int n_samp = 256;
+        for (int s = 0; s <= n_samp; s++) {
+            double tt = (double)s / n_samp;
+            V2 Q = eval_edge(eid, tt);
+            V2 T = eval_edge_d1(eid, tt);
+            double tl = sqrt(T.x * T.x + T.y * T.y);
+            if (tl < 1e-9) continue;
+            T.x /= tl; T.y /= tl;
+            int cx = (int)floor(Q.x), cy = (int)floor(Q.y);
+            for (int dy = -2; dy <= 2; dy++) {
+                for (int dx = -2; dx <= 2; dx++) {
+                    int px = cx + dx, py = cy + dy;
+                    if (px < x0 || px > x1 || py < y0 || py > y1) continue;
+                    double ex = px + 0.5 - Q.x, ey = py + 0.5 - Q.y;
+                    if (ex * ex + ey * ey > 2.5 * 2.5) continue;
+                    double side = ex * T.y - ey * T.x;   /* + = left side */
+                    int idx = (py - y0) * W + (px - x0);
+                    fixed[idx] = 1;
+                    if (side >= 0) { R[idx] = lc.r; G[idx] = lc.g; B[idx] = lc.b; }
+                    else           { R[idx] = rc.r; G[idx] = rc.g; B[idx] = rc.b; }
+                }
+            }
+        }
+    }
+
+    /* SOR relaxation, bounded iterations (deterministic: same input, same
+       trajectory; max-change threshold breaks early) */
+    int maxiter = (area > 400000L) ? 300 : 600;
+    const double omega = 1.6;
+    for (int it = 0; it < maxiter; it++) {
+        double maxch = 0.0;
+        for (int y = 1; y < H - 1; y++) {
+            for (int x = 1; x < W - 1; x++) {
+                int idx = y * W + x;
+                if (fixed[idx]) continue;
+                double nvR = 0.25 * (R[idx - 1] + R[idx + 1] + R[idx - W] + R[idx + W]);
+                double chR = omega * (nvR - R[idx]);
+                R[idx] += chR;
+                if (fabs(chR) > maxch) maxch = fabs(chR);
+                double nvG = 0.25 * (G[idx - 1] + G[idx + 1] + G[idx - W] + G[idx + W]);
+                double chG = omega * (nvG - G[idx]);
+                G[idx] += chG;
+                if (fabs(chG) > maxch) maxch = fabs(chG);
+                double nvB = 0.25 * (B[idx - 1] + B[idx + 1] + B[idx - W] + B[idx + W]);
+                double chB = omega * (nvB - B[idx]);
+                B[idx] += chB;
+                if (fabs(chB) > maxch) maxch = fabs(chB);
+            }
+        }
+        if (maxch < 0.25 / 255.0) break;   /* converged below 1/4 of a level */
+    }
+
+    /* write the solved field back (region border == background, so the
+       transition to the surrounding artwork is continuous) */
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            int idx = y * W + x;
+            int o = ((y0 + y) * FW + (x0 + x)) * 3;
+            fb[o]     = (uint8_t)(R[idx] < 0 ? 0 : R[idx] > 255 ? 255 : R[idx]);
+            fb[o + 1] = (uint8_t)(G[idx] < 0 ? 0 : G[idx] > 255 ? 255 : G[idx]);
+            fb[o + 2] = (uint8_t)(B[idx] < 0 ? 0 : B[idx] > 255 ? 255 : B[idx]);
+        }
+    }
+
+    free(R); free(G); free(B); free(fixed);
 }
 
 /* ─── Render ─── */
@@ -1077,7 +1204,7 @@ static void render(void) {
     /* Strokes (per-pixel, variable width along t) */
     for (int si = 0; si < n_s; si++)
         if (strokes[si].nw > 0)
-            stroke_edge_perpixel(strokes[si].eid, strokes[si].w, strokes[si].nw, strokes[si].c, sc);
+            stroke_edge_perpixel(strokes[si].eid, strokes[si].w, strokes[si].nw, strokes[si].c, sc, strokes[si].cap);
 
     /* Arcs */
     for (int i = 0; i < n_arc; i++) {
@@ -1121,6 +1248,115 @@ static void write_bmp(const char *path) {
     fclose(f);
 }
 
+/* ── PNG output (self-contained: stored-deflate zlib stream, filter 0) ── */
+static uint32_t crc_tab[256];
+static void crc_init(void) {
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+        crc_tab[i] = c;
+    }
+}
+/* raw (running) CRC-32 update: no complement on entry/exit, so calls chain */
+static uint32_t crc32_raw(uint32_t c, const uint8_t *p, size_t n) {
+    for (size_t i = 0; i < n; i++) c = crc_tab[(c ^ p[i]) & 0xFF] ^ (c >> 8);
+    return c;
+}
+static void png_chunk(FILE *f, const char *type, const uint8_t *data, uint32_t len) {
+    uint8_t hdr[8] = { (uint8_t)(len >> 24), (uint8_t)(len >> 16), (uint8_t)(len >> 8), (uint8_t)len,
+                       (uint8_t)type[0], (uint8_t)type[1], (uint8_t)type[2], (uint8_t)type[3] };
+    fwrite(hdr, 1, 8, f);
+    if (len) fwrite(data, 1, len, f);
+    uint32_t c = 0xFFFFFFFFu;
+    c = crc32_raw(c, (const uint8_t *)type, 4);
+    if (len) c = crc32_raw(c, data, len);
+    c ^= 0xFFFFFFFFu;
+    uint8_t cb[4] = { (uint8_t)(c >> 24), (uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c };
+    fwrite(cb, 1, 4, f);
+}
+
+static void write_png(const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    static const uint8_t sig[8] = { 137, 80, 78, 71, 13, 10, 26, 10 };
+    fwrite(sig, 1, 8, f);
+    uint8_t ihdr[13] = { 0 };
+    ihdr[0] = FW >> 24; ihdr[1] = FW >> 16; ihdr[2] = FW >> 8; ihdr[3] = FW;
+    ihdr[4] = FH >> 24; ihdr[5] = FH >> 16; ihdr[6] = FH >> 8; ihdr[7] = FH;
+    ihdr[8] = 8;   /* bit depth */
+    ihdr[9] = 2;   /* color type: RGB */
+    png_chunk(f, "IHDR", ihdr, 13);
+
+    /* IDAT: zlib stream (header 0x78 0x01) with stored deflate blocks and
+       filter-0 scanlines.  The chunk length is known up front, so we can
+       stream the blocks and update the CRC incrementally. */
+    size_t raw_len = (1 + (size_t)FW * 3) * (size_t)FH;   /* filter + RGB per row */
+    int nblocks = (int)((raw_len + 65534) / 65535);
+    uint32_t idat_len = (uint32_t)(2 + 4 + raw_len + 5 * (size_t)nblocks);
+    uint8_t hdr8[8] = { (uint8_t)(idat_len >> 24), (uint8_t)(idat_len >> 16),
+                        (uint8_t)(idat_len >> 8), (uint8_t)idat_len,
+                        'I', 'D', 'A', 'T' };
+    fwrite(hdr8, 1, 8, f);
+    uint32_t c = 0xFFFFFFFFu;
+    c = crc32_raw(c, (const uint8_t *)"IDAT", 4);
+
+    uint8_t zl[2] = { 0x78, 0x01 };
+    fwrite(zl, 1, 2, f);
+    c = crc32_raw(c, zl, 2);
+
+    uint8_t tmp[65536];
+    size_t used = 0;
+    uint32_t adler_a = 1, adler_b = 0;   /* adler32 of the raw (filtered) stream */
+    uint64_t written = 0;                /* bytes of raw stream emitted so far */
+    for (int y = 0; y < FH; y++) {
+        tmp[used++] = 0;                 /* filter: None */
+        adler_a = (adler_a + 0) % 65521;
+        adler_b = (adler_b + adler_a) % 65521;
+        int o = y * FW * 3;
+        for (int x = 0; x < FW; x++) {
+            tmp[used++] = fb[o + x * 3];
+            adler_a = (adler_a + fb[o + x * 3]) % 65521;
+            adler_b = (adler_b + adler_a) % 65521;
+            tmp[used++] = fb[o + x * 3 + 1];
+            adler_a = (adler_a + fb[o + x * 3 + 1]) % 65521;
+            adler_b = (adler_b + adler_a) % 65521;
+            tmp[used++] = fb[o + x * 3 + 2];
+            adler_a = (adler_a + fb[o + x * 3 + 2]) % 65521;
+            adler_b = (adler_b + adler_a) % 65521;
+        }
+        if (used + 1 + (size_t)FW * 3 > sizeof(tmp) || y == FH - 1) {
+            /* flush a stored block */
+            size_t len = used;
+            uint8_t *p = tmp;
+            while (len > 0) {
+                size_t chunk = len > 65535 ? 65535 : len;
+                int final = (written + chunk == raw_len) ? 1 : 0;
+                uint8_t bh[5] = { (uint8_t)final,
+                                  (uint8_t)(chunk & 0xFF), (uint8_t)((chunk >> 8) & 0xFF),
+                                  (uint8_t)((~chunk) & 0xFF), (uint8_t)((~(chunk >> 8)) & 0xFF) };
+                fwrite(bh, 1, 5, f);
+                c = crc32_raw(c, bh, 5);
+                fwrite(p, 1, chunk, f);
+                c = crc32_raw(c, p, chunk);
+                p += chunk;
+                len -= chunk;
+                written += chunk;
+            }
+            used = 0;
+        }
+    }
+    uint32_t adler = (adler_b << 16) | adler_a;
+    uint8_t tr[4] = { (uint8_t)(adler >> 24), (uint8_t)(adler >> 16), (uint8_t)(adler >> 8), (uint8_t)adler };
+    fwrite(tr, 1, 4, f);
+    c = crc32_raw(c, tr, 4);
+    c ^= 0xFFFFFFFFu;
+    uint8_t cb[4] = { (uint8_t)(c >> 24), (uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c };
+    fwrite(cb, 1, 4, f);
+
+    png_chunk(f, "IEND", NULL, 0);
+    fclose(f);
+}
+
 /* ── WebP output via external converter (fork/exec only — no shell) ── */
 static int try_exec(char *const argv[]) {
     pid_t pid = fork();
@@ -1150,7 +1386,7 @@ static void write_svg(const char *path) {
     double ox, oy, sc; view(&ox, &oy, &sc);
     fprintf(f, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     fprintf(f, "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 %d %d\" width=\"%d\" height=\"%d\">\n", FW, FH, FW, FH);
-    fprintf(f, "  <!-- SmazkaVG v1.3 SVG projection -->\n");
+    fprintf(f, "  <!-- SmazkaVG v1.4 SVG projection -->\n");
     fprintf(f, "  <rect width=\"%d\" height=\"%d\" fill=\"white\"/>\n", FW, FH);
 
     /* Ellipses */
@@ -1223,17 +1459,18 @@ static void write_svg(const char *path) {
         Col c = strokes[si].c;
         double aw = 0; for (int w = 0; w < strokes[si].nw; w++) aw += strokes[si].w[w];
         aw /= strokes[si].nw;
+        const char *cap = strokes[si].cap == 1 ? "butt" : strokes[si].cap == 2 ? "square" : "round";
         if (edges[eid].type == E_CUBIC && edges[eid].n_cp >= 2) {
             V2 c1 = s2s(edges[eid].cp[0], ox, oy, sc), c2 = s2s(edges[eid].cp[1], ox, oy, sc);
-            fprintf(f, "  <path id=\"s%d\" d=\"M %.2f,%.2f C %.2f,%.2f %.2f,%.2f %.2f,%.2f\" stroke=\"rgba(%d,%d,%d,%.2f)\" stroke-width=\"%.2f\" stroke-linecap=\"round\" fill=\"none\"/>\n",
-                    si, sa.x, sa.y, c1.x, c1.y, c2.x, c2.y, sb.x, sb.y, c.r, c.g, c.b, c.a / 255.0, aw * sc);
+            fprintf(f, "  <path id=\"s%d\" d=\"M %.2f,%.2f C %.2f,%.2f %.2f,%.2f %.2f,%.2f\" stroke=\"rgba(%d,%d,%d,%.2f)\" stroke-width=\"%.2f\" stroke-linecap=\"%s\" fill=\"none\"/>\n",
+                    si, sa.x, sa.y, c1.x, c1.y, c2.x, c2.y, sb.x, sb.y, c.r, c.g, c.b, c.a / 255.0, aw * sc, cap);
         } else if (edges[eid].type == E_QUAD && edges[eid].n_cp >= 1) {
             V2 c1 = s2s(edges[eid].cp[0], ox, oy, sc);
-            fprintf(f, "  <path id=\"s%d\" d=\"M %.2f,%.2f Q %.2f,%.2f %.2f,%.2f\" stroke=\"rgba(%d,%d,%d,%.2f)\" stroke-width=\"%.2f\" stroke-linecap=\"round\" fill=\"none\"/>\n",
-                    si, sa.x, sa.y, c1.x, c1.y, sb.x, sb.y, c.r, c.g, c.b, c.a / 255.0, aw * sc);
+            fprintf(f, "  <path id=\"s%d\" d=\"M %.2f,%.2f Q %.2f,%.2f %.2f,%.2f\" stroke=\"rgba(%d,%d,%d,%.2f)\" stroke-width=\"%.2f\" stroke-linecap=\"%s\" fill=\"none\"/>\n",
+                    si, sa.x, sa.y, c1.x, c1.y, sb.x, sb.y, c.r, c.g, c.b, c.a / 255.0, aw * sc, cap);
         } else {
-            fprintf(f, "  <line id=\"s%d\" x1=\"%.2f\" y1=\"%.2f\" x2=\"%.2f\" y2=\"%.2f\" stroke=\"rgba(%d,%d,%d,%.2f)\" stroke-width=\"%.2f\" stroke-linecap=\"round\"/>\n",
-                    si, sa.x, sa.y, sb.x, sb.y, c.r, c.g, c.b, c.a / 255.0, aw * sc);
+            fprintf(f, "  <line id=\"s%d\" x1=\"%.2f\" y1=\"%.2f\" x2=\"%.2f\" y2=\"%.2f\" stroke=\"rgba(%d,%d,%d,%.2f)\" stroke-width=\"%.2f\" stroke-linecap=\"%s\"/>\n",
+                    si, sa.x, sa.y, sb.x, sb.y, c.r, c.g, c.b, c.a / 255.0, aw * sc, cap);
         }
     }
 
@@ -1289,7 +1526,7 @@ static void strip_ext(const char *in, char *out, int sz) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "SmazkaVG v1.3.1 Rasterizer\nUsage: %s <in.smazka> [w] [h]\n", argv[0]);
+        fprintf(stderr, "SmazkaVG v1.4 Rasterizer\nUsage: %s <in.smazka> [w] [h]\n", argv[0]);
         return 1;
     }
     const char *inp = argv[1];
@@ -1310,19 +1547,22 @@ int main(int argc, char **argv) {
         else if (edges[i].type == E_RATIONAL) nr++;
         else if (edges[i].type == E_CATMULL) nm++;
     }
-    fprintf(stderr, "v1.3: %d verts, %d edges (seg:%d quad:%d cubic:%d rat:%d cat:%d), %d faces, %d strokes, %d arcs, %d ellipses, %d warnings\n",
+    fprintf(stderr, "v1.4: %d verts, %d edges (seg:%d quad:%d cubic:%d rat:%d cat:%d), %d faces, %d strokes, %d arcs, %d ellipses, %d warnings\n",
             n_v, n_e, n_e - nq - nc - nr - nm, nq, nc, nr, nm, n_f, n_s, n_arc, n_ell, n_warn);
 
     fb_init(w, h);
     render();
 
     char base[512]; strip_ext(inp, base, sizeof(base));
-    char bmp_p[560], webp_p[560], svg_p[560], txt_p[560];
+    char bmp_p[560], webp_p[560], png_p[560], svg_p[560], txt_p[560];
     snprintf(bmp_p, sizeof(bmp_p), "%s.bmp", base);
     snprintf(webp_p, sizeof(webp_p), "%s.webp", base);
+    snprintf(png_p, sizeof(png_p), "%s.png", base);
     snprintf(svg_p, sizeof(svg_p), "%s.svg", base);
     snprintf(txt_p, sizeof(txt_p), "%s.txt", base);
 
+    crc_init();
+    write_png(png_p);   fprintf(stderr, "PNG:  %s (%dx%d)\n", png_p, w, h);
     write_bmp(bmp_p);   fprintf(stderr, "BMP:  %s (%dx%d, %d KB)\n", bmp_p, w, h, (54 + w * h * 3) / 1024);
     write_webp(bmp_p, webp_p); fprintf(stderr, "WebP: %s\n", webp_p);
     write_svg(svg_p);   fprintf(stderr, "SVG:  %s\n", svg_p);

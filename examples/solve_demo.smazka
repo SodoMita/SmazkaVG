@@ -1,0 +1,18 @@
+# Solve demo: constraints resolved by smazka-solve before rendering
+#  - two vertices are 1 unit apart but min_dist requires >= 50
+#  - a third vertex must stay inside a bbox
+#  - linear_eq 2x+y=80 couples two coordinates
+v 0 100 100
+v 1 101 100
+v 2 100 300
+e 0 0 1
+e 1 1 2
+e 2 2 0
+f 0 0 1 2
+c 0 min_dist 0 1 50.0
+c 1 bbox_clamp 2 50 200 150 400
+c 2 linear_eq 80.0 0 2.0 3 1.0
+s 0 0 0000FF 2 2
+s 1 1 FF0000 2 2
+s 2 2 00AA00 2 2
+p 0 solid_fill 0 F0F0FF

@@ -1,0 +1,17 @@
+# Diffusion-curve demo (v1.4 Poisson solver)
+# A curved spine with warm/cool colors diffusing into a filled background.
+v 0 20 20
+v 1 380 20
+v 2 380 280
+v 3 20 280
+e 0 0 1
+e 1 1 2
+e 2 2 3
+e 3 3 0
+f 0 0 1 2 3
+p 0 solid_fill 0 E8E8E8
+v 4 60 180
+v 5 340 180
+e 4 4 5 type=cubic 120 80 280 80
+p 1 diffusion 4 L FF6B35 R 2E86DE
+s 0 4 303030 2.5 2.5

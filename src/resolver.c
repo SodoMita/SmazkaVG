@@ -90,7 +90,7 @@ typedef struct { q16_t x, y; uint32_t flags; } Vertex;
 typedef struct { int32_t v_start, v_end; uint32_t flags; } Edge;
 typedef struct { uint16_t *edge_ids; int n_edges; uint32_t fill_id; } Face;
 typedef struct { int32_t edge_id; uint32_t color; q16_t *widths; int n_widths; } Stroke;
-typedef struct { q16_t tx, ty, rot, sx, sy, skew; int32_t content_ref; } Node;
+typedef struct { q16_t tx, ty, rot, sx, sy, skew; int32_t content_ref; uint32_t flags; } Node;
 
 typedef struct {
     int n_vertices, n_edges, n_faces, n_strokes, n_nodes;
@@ -239,6 +239,10 @@ static void resolve_hierarchy(Document *doc, int *warnings) {
             }
         }
     }
+
+    /* persist cycle membership for the rig QP (resolve_qp reads flags bit 0) */
+    for (int i = 0; i < n; i++)
+        if (cycle[i]) doc->prims.nodes[i].flags |= 1;
 
     /* Acyclic chains: bottom-up world transform multiplication (O(n)).
        world_xform[i] = world_xform[parent_of[i]] x local_xform[i]. */
@@ -826,6 +830,88 @@ static void resolve_qp(Document *doc, int *warnings) {
         }
         free(q.Q); free(q.c); free(q.A); free(q.b);
     }
+
+    /* rig: translation-only equilibrium for cyclic parent chains (v1.2
+       semantics, SPEC §5.2.1).  Cycle members are flagged by
+       resolve_hierarchy (flags bit 0).  We solve the soft-consistency QP
+       over the members' world translations:
+         min  Σ_k ||x_k - x0_k||²  +  λ Σ_{(c,p)} ||x_c - x_p - t_c||²
+       where t_c is node c's local offset.  λ is large so consistent cycles
+       are satisfied exactly while the regularization anchors the global
+       translation.  The solved values are written back to the nodes' tx/ty
+       as the equilibrium world offset (rotation/scale rigs are future work;
+       see SPEC.md §11.1). */
+    for (int i = 0; i < doc->config.n_constraints; i++) {
+        Constraint *c = &doc->config.constraints[i];
+        if (c->section != SEC_CONSTRAINT || c->subtype != C_RIG_EQUILIBRIUM) continue;
+
+        int N = doc->prims.n_nodes;
+        int *map = (int *)malloc((size_t)(N ? N : 1) * sizeof(int));
+        int *idlist = (int *)malloc((size_t)(N ? N : 1) * sizeof(int));
+        if (!map || !idlist) { free(map); free(idlist); continue; }
+        for (int k = 0; k < N; k++) map[k] = -1;
+        int m = 0;
+        for (int k = 0; k < N; k++)
+            if (doc->prims.nodes[k].flags & 1) { map[k] = m; idlist[m++] = k; }
+        if (m == 0) { free(map); free(idlist); continue; }
+
+        int nvar = 2 * m;
+        SmallQP q;
+        q.n = nvar;
+        q.Q = (double *)calloc((size_t)nvar * nvar, sizeof(double));
+        q.c = (double *)calloc((size_t)nvar, sizeof(double));
+        q.m = 1;                                   /* trivial row 0 <= 0 */
+        q.A = (double *)calloc((size_t)nvar, sizeof(double));
+        q.b = (double *)malloc(sizeof(double));
+        if (!q.Q || !q.c || !q.A || !q.b) { warn_(warnings, "rig: alloc"); free(map); free(idlist); free(q.Q); free(q.c); free(q.A); free(q.b); continue; }
+        q.b[0] = 0.0;
+
+        const double lam = 1e6;
+        /* regularization ||x - x0||² */
+        for (int k = 0; k < m; k++) {
+            int nid = idlist[k];
+            q.Q[(size_t)(2 * k) * nvar + 2 * k] += 1.0;
+            q.Q[(size_t)(2 * k + 1) * nvar + 2 * k + 1] += 1.0;
+            q.c[2 * k]     -= from_q16(doc->prims.nodes[nid].tx);
+            q.c[2 * k + 1] -= from_q16(doc->prims.nodes[nid].ty);
+        }
+        /* consistency edges: parent relationships among cycle members */
+        for (int ci = 0; ci < doc->config.n_constraints; ci++) {
+            Constraint *cc = &doc->config.constraints[ci];
+            if (cc->section != SEC_STRUCTURAL || cc->subtype != S_PARENT) continue;
+            int child = cc->u.parent.child, parent = cc->u.parent.parent;
+            int cm = (child >= 0 && child < N) ? map[child] : -1;
+            int pm = (parent >= 0 && parent < N) ? map[parent] : -1;
+            if (cm < 0 || pm < 0) continue;
+            double tx = from_q16(doc->prims.nodes[child].tx);
+            double ty = from_q16(doc->prims.nodes[child].ty);
+            int ccx = 2 * cm, ccy = ccx + 1, cpx = 2 * pm, cpy = cpx + 1;
+            q.Q[(size_t)ccx * nvar + ccx] += lam;
+            q.Q[(size_t)ccy * nvar + ccy] += lam;
+            q.Q[(size_t)cpx * nvar + cpx] += lam;
+            q.Q[(size_t)cpy * nvar + cpy] += lam;
+            q.Q[(size_t)ccx * nvar + cpx] -= lam;
+            q.Q[(size_t)cpx * nvar + ccx] -= lam;
+            q.Q[(size_t)ccy * nvar + cpy] -= lam;
+            q.Q[(size_t)cpy * nvar + ccy] -= lam;
+            q.c[ccx] -= lam * tx;
+            q.c[ccy] -= lam * ty;
+            q.c[cpx] += lam * tx;
+            q.c[cpy] += lam * ty;
+        }
+
+        double *sol = (double *)calloc((size_t)nvar, sizeof(double));
+        if (qp_solve_small(&q, sol, warnings) == 0) {
+            for (int k = 0; k < m; k++) {
+                int nid = idlist[k];
+                doc->prims.nodes[nid].tx = to_q16(sol[2 * k]);
+                doc->prims.nodes[nid].ty = to_q16(sol[2 * k + 1]);
+            }
+        }
+        free(sol);
+        free(q.Q); free(q.c); free(q.A); free(q.b);
+        free(map); free(idlist);
+    }
 }
 
 #else /* !SMZ_HAVE_PSOLVE */
@@ -1092,6 +1178,35 @@ int main(void) {
         int ok = fabs(x - 100.0) < 1e-2 && fabs(y - 100.0) < 1e-2;
         if (ok) printf("PASS test10: QP min_stretch: (500,500) w/ bbox[0,100] -> (%.2f,%.2f)\n", x, y);
         else { printf("FAIL test10: got (%.2f,%.2f)\n", x, y); failures++; }
+    }
+#endif /* SMZ_HAVE_PSOLVE */
+
+    /* ── Test 11: rig — translation-only equilibrium for a consistent cycle ── */
+#ifdef SMZ_HAVE_PSOLVE
+    {
+        memset(&doc, 0, sizeof(doc)); doc.config.max_iter = MAX_ITER_DEFAULT; doc.config.max_ms = 200;
+        doc.prims.n_nodes = 3;
+        Constraint *p;
+        p = add_c(&doc, SEC_STRUCTURAL, S_PARENT); p->u.parent.child = 1; p->u.parent.parent = 0;
+        p = add_c(&doc, SEC_STRUCTURAL, S_PARENT); p->u.parent.child = 2; p->u.parent.parent = 1;
+        p = add_c(&doc, SEC_STRUCTURAL, S_PARENT); p->u.parent.child = 0; p->u.parent.parent = 2;
+        /* local offsets: t0=(10,0) t1=(5,0) t2=(-15,0) — consistent (sum 0) */
+        doc.prims.nodes[0].tx = to_q16(10.0); doc.prims.nodes[0].ty = 0;
+        doc.prims.nodes[1].tx = to_q16(5.0);  doc.prims.nodes[1].ty = 0;
+        doc.prims.nodes[2].tx = to_q16(-15.0); doc.prims.nodes[2].ty = 0;
+        Constraint *rg = add_c(&doc, SEC_CONSTRAINT, C_RIG_EQUILIBRIUM);
+        rg->u.rig.node_a = 0; rg->u.rig.node_b = 1;
+        smazka_resolve(&doc);
+        /* consistency: world_child - world_parent = t_child */
+        double w0 = from_q16(doc.prims.nodes[0].tx);
+        double w1 = from_q16(doc.prims.nodes[1].tx);
+        double w2 = from_q16(doc.prims.nodes[2].tx);
+        double e01 = fabs((w1 - w0) - 5.0);   /* t1 = 5  */
+        double e12 = fabs((w2 - w1) - (-15.0)); /* t2 = -15 */
+        double e20 = fabs((w0 - w2) - 10.0);  /* t0 = 10 */
+        int ok = e01 < 1e-2 && e12 < 1e-2 && e20 < 1e-2;
+        if (ok) printf("PASS test11: rig equilibrium (world offsets %.2f, %.2f, %.2f)\n", w0, w1, w2);
+        else { printf("FAIL test11: world (%.2f, %.2f, %.2f) errors (%.3f, %.3f, %.3f)\n", w0, w1, w2, e01, e12, e20); failures++; }
     }
 #endif /* SMZ_HAVE_PSOLVE */
 

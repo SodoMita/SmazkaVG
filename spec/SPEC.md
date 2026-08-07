@@ -1,10 +1,11 @@
 # SmazkaVG v1.3 Formal Specification
 
 > Flat Document Model · LP + Convex QP Solver · Fixed-Point Determinism
-> Revision 1.3.2 — 2026-08-07
+> Revision 1.4 — 2026-08-07
 > Supersedes v1.1 (SMT-era) and v1.2 (namespace split). This revision
 > documents the reference rasterizer (`src/rasterizer.c`) and resolver
-> (`src/resolver.c`) as shipped, including the psolve LP/QP backend.
+> (`src/resolver.c`) as shipped: psolve LP/QP backend, Poisson diffusion
+> curves, stroke caps/joins, native PNG output, and the `smazka-solve` tool.
 
 ---
 
@@ -46,6 +47,7 @@
 | v1.3 | Reference rasterizer: per-pixel distance-field rendering (no tessellation). Curve types extended: `quad`, `rational` (conic), `catmull`. New primitives: `r` arc, `z` ellipse. Vertex types (`corner`/`smooth`/`symmetric`/`auto`). Face inline fill field. View-fit includes control points. WebP export. |
 | v1.3.1 | Audit pass: parser bounds-checking, ear-clipping face fills, true taper rendering, curve-aware diffusion brush, resolver fixes (cycle detection, state-machine activation, SLP min_dist). |
 | v1.3.2 | psolve integration: submodule + `libpsolve.a`; resolver LP/QP phases implemented (L1 least-change, SLP with post-solve check, fair_blend/min_stretch QPs); `make solver-test` with 10-test self-suite. |
+| v1.4 | Diffusion curves are a real discrete Laplace (Poisson) solve (SOR, bounded, deterministic) instead of a signed-distance brush. Stroke caps (round/butt/square; round caps form round joins). Self-contained PNG output. `tools/smazka-solve` applies the resolver to a file end-to-end. Resolver `rig` QP implemented (translation-only equilibrium). |
 
 ---
 
@@ -288,8 +290,12 @@ Offset  Size  Field          Description
 
 The width profile is a **function along the edge parameter t ∈ [0,1]**; the
 rasterizer interpolates linearly between samples. A single width value is
-equivalent to a constant profile. `join` attributes (miter/round/bevel) are
-reserved for future revisions (they require path-level geometry).
+equivalent to a constant profile. Stroke caps are `cap=round` (default),
+`cap=butt`, or `cap=square` (extends by half the local width along the tangent;
+segments only). Round caps at a vertex shared by two or more stroked edges form
+a **round join** (the endpoint half-disks overlap, closing the corner notch);
+explicit miter/bevel joins are future revisions (they require path-level
+geometry).
 
 ### 4.6 Node Record (28 bytes)
 
@@ -461,16 +467,29 @@ failure. Solver runtime is bounded by O(n³ + n²·MAX_ITER).
 | `0x01` | `diffusion` | `edge_id, left_color(RGBA), right_color(RGBA)` | smooth color field across the edge (see §5.6.1) |
 | `0x02` | `solid_fill` | `face_id, color(RGBA)` | flat fill; overrides the face's inline `fill` |
 
-#### 5.6.1 Diffusion curves — honest description
+#### 5.6.1 Diffusion curves — discrete Laplace (Poisson) solve
 
-The v1.1 spec promised a discrete cotangent-Laplacian PDE solve
-(`L·c = b`, Orzan et al. 2008). The v1.3 reference rasterizer implements a
-**signed-distance curve brush**: for each pixel within the falloff radius of
-the diffusion edge, the color blends left→right across the signed distance from
-the curve's closest point, with a linear falloff in distance. It follows curved
-spines (the v1.1 brush was a straight-line perpendicular gradient only) but it
-is **not** a PDE diffusion and does not flow around topology. A full
-cotangent-Laplacian solver over the face mesh is planned (see §11.1).
+`p diffusion <edge> L <left_color> R <right_color>` solves the Laplace equation
+over the framebuffer region around the edge:
+
+```
+∇²c = 0
+c = left_color   on one side of the curve   (Dirichlet)
+c = right_color  on the other side          (Dirichlet)
+c = artwork      at the region border       (the field diffuses into the fill)
+```
+
+The sides are defined relative to the direction of travel along the edge (the
+left side is the one on the left when facing the direction of travel; for an
+edge running left→right, L is above). The reference rasterizer discretizes the
+problem per pixel and solves it with successive over-relaxation (SOR,
+ω = 1.6) using bounded, deterministic iterations (max-change < 1/4 level stops
+early; the iteration count is capped by region size). This is the Orzan et al.
+(2008) diffusion-curves model: the field follows curved spines, is smooth and
+harmonic away from the curve, and falls off to the artwork at the region
+border. The v1.3 signed-distance brush and the v1.1 straight-line gradient are
+superseded. A cotangent-Laplacian solve over the *face mesh* (instead of the
+pixel grid) remains future work (§11.1).
 
 ---
 
@@ -783,6 +802,20 @@ The format **bans** all external references:
 - Coordinates are **delta-encoded** relative to the previous record of the same
   type (dx, dy), giving typical savings of 3–6× versus raw Q16.16 words.
 - Round-trips losslessly: `smazka-line2bin x.smazka > x.smvg && smazka-bin2line x.smvg` reproduces the document.
+
+### 11.2b Solve Pipeline (tools/smazka-solve)
+
+`smazka-solve` parses a Line-ASM document into the resolver's in-memory model,
+runs `smazka_resolve` (structural / assertions / automata / LP / convex QP via
+psolve), and writes the resolved document back: vertex positions and node
+translations updated, everything else preserved verbatim. This closes the loop
+between the constraint language and the rendered output:
+
+```
+in.smazka ──► smazka-solve ──► resolved.smazka ──► smazka-raster ──► .png
+```
+
+See `examples/solve_demo.smazka` (min_dist + bbox_clamp + linear_eq).
 
 ### 11.3 Code-Golf Dialect (tools/smazka-golf)
 

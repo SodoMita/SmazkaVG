@@ -64,11 +64,12 @@ if [ -d "$ROOT/third_party/psolve" ]; then
     if [ -x "$BUILD/solver-test" ]; then
         "$BUILD/solver-test" > "$BUILD/t/solver.out" 2>&1
         rc=$?
-        check "solver self-test passes (10 tests incl. LP/QP)" "[ $rc -eq 0 ]"
+        check "solver self-test passes (11 tests incl. LP/QP)" "[ $rc -eq 0 ]"
         check "solver tests LP bbox (test6)" "grep -q 'PASS test6' '$BUILD/t/solver.out'"
         check "solver tests LP min_dist SLP (test8)" "grep -q 'PASS test8' '$BUILD/t/solver.out'"
         check "solver tests QP fair_blend (test9)" "grep -q 'PASS test9' '$BUILD/t/solver.out'"
         check "solver tests QP min_stretch (test10)" "grep -q 'PASS test10' '$BUILD/t/solver.out'"
+        check "solver tests QP rig equilibrium (test11)" "grep -q 'PASS test11' '$BUILD/t/solver.out'"
     fi
 else
     echo "  SKIP: psolve submodule not checked out (git submodule update --init)"
@@ -79,6 +80,124 @@ echo "== golf dialect =="
 check "golf expands" "[ -s '$BUILD/t/golf.smazka' ]"
 "$BUILD/smazka-raster" "$BUILD/t/golf.smazka" 256 256 >/dev/null 2>&1
 check "golf output renders" "[ $? -eq 0 ]"
+
+echo "== PNG output =="
+"$BUILD/smazka-raster" examples/triangle_v1.2.smazka 256 256 >/dev/null 2>&1
+python3 - "$ROOT" <<'EOF'
+import sys
+from PIL import Image
+import numpy as np
+png = np.asarray(Image.open(sys.argv[1] + '/examples/triangle_v1.2.png').convert('RGB'))
+bmp = np.asarray(Image.open(sys.argv[1] + '/examples/triangle_v1.2.bmp').convert('RGB'))
+assert png.shape == bmp.shape == (256, 256, 3), png.shape
+assert (png == bmp).all(), "PNG pixels differ from BMP"
+print("  PASS: PNG decodes and matches BMP pixel-for-pixel")
+EOF
+check "PNG valid + matches BMP" "[ $? -eq 0 ]"
+
+echo "== stroke caps & joins =="
+cat > "$BUILD/t/caps.smazka" <<'EOF'
+v 0 50 50
+v 1 100 50
+v 2 50 150
+v 3 150 150
+e 0 0 1
+e 1 2 3
+s 0 0 FF0000 20 20 cap=round
+s 1 1 0000FF 20 20 cap=butt
+EOF
+cat > "$BUILD/t/join.smazka" <<'EOF'
+v 0 100 100
+v 1 200 100
+v 2 100 200
+e 0 0 1
+e 1 0 2
+s 0 0 000000 30 30
+s 1 1 000000 30 30
+EOF
+"$BUILD/smazka-raster" "$BUILD/t/caps.smazka" 256 256 >/dev/null 2>&1
+"$BUILD/smazka-raster" "$BUILD/t/join.smazka" 256 256 >/dev/null 2>&1
+"$BUILD/smazka-raster" "$BUILD/t/join_butt.smazka" 256 256 >/dev/null 2>&1 2>/dev/null || true
+sed 's/ 30 30$/ 30 30 cap=butt/' "$BUILD/t/join.smazka" > "$BUILD/t/joinb.smazka"
+"$BUILD/smazka-raster" "$BUILD/t/joinb.smazka" 256 256 >/dev/null 2>&1
+python3 - "$BUILD/t" <<'EOF'
+import sys, os
+from PIL import Image
+import numpy as np
+t = sys.argv[1]
+im = np.asarray(Image.open(t + '/caps.bmp').convert('RGB')).astype(int)
+red = (im[:,:,0]>150)&(im[:,:,1]<100)&(im[:,:,2]<100)
+blue = (im[:,:,2]>150)&(im[:,:,0]<100)&(im[:,:,1]<100)
+r = red[34:66, :]; b = blue[190:222, :]
+# strip vertex markers
+for m in (r, b):
+    m[13:19, 47:53] = False
+assert r[:, :50].sum() > 0, "round cap missing"
+assert b[:, :50].sum() == 0, "butt cap not flat"
+j1 = np.asarray(Image.open(t + '/join.bmp').convert('RGB')).astype(int)
+j2 = np.asarray(Image.open(t + '/joinb.bmp').convert('RGB')).astype(int)
+d1 = (j1[:,:,0]<120)&(j1[:,:,1]<120)&(j1[:,:,2]<120)
+d2 = (j2[:,:,0]<120)&(j2[:,:,1]<120)&(j2[:,:,2]<120)
+assert d1[:50,:50].sum() > 0, "round join notch not filled"
+assert d2[:50,:50].sum() == 0, "butt join should leave notch empty"
+print("  PASS: round/butt caps and round-vs-butt joins")
+EOF
+check "caps + joins render correctly" "[ $? -eq 0 ]"
+
+echo "== diffusion (Poisson) =="
+cat > "$BUILD/t/diff.smazka" <<'EOF'
+v 0 200 50
+v 1 200 350
+e 0 0 1
+p 0 diffusion 0 L FF0000 R 0000FF
+EOF
+"$BUILD/smazka-raster" "$BUILD/t/diff.smazka" 256 256 >/dev/null 2>&1
+cp "$BUILD/t/diff.bmp" "$BUILD/t/diff_r1.bmp"
+"$BUILD/smazka-raster" "$BUILD/t/diff.smazka" 256 256 >/dev/null 2>&1
+cmp -s "$BUILD/t/diff.bmp" "$BUILD/t/diff_r1.bmp"
+check "diffusion deterministic (byte-identical reruns)" "[ $? -eq 0 ]"
+python3 - "$BUILD/t" <<'EOF'
+import sys
+from PIL import Image
+import numpy as np
+im = np.asarray(Image.open(sys.argv[1] + '/diff.bmp').convert('RGB')).astype(int)
+row = im[128].astype(float)
+# find the transition (red/blue boundary); sides are relative to travel direction
+rb = row[:,0] - row[:,2]
+line = int(np.argmax(np.abs(np.diff(rb))))
+# near the curve (3-5 px): left side blue-dominant, right side red-dominant
+left = row[line-5:line-3]; right = row[line+3:line+5]
+assert left[:,0].mean() < 80 and left[:,2].mean() > 200, f"left side not blue {left.mean(axis=0)}"
+assert right[:,0].mean() > 200 and right[:,2].mean() < 80, f"right side not red {right.mean(axis=0)}"
+# smoothness away from the 6px line: no jumps > 12
+mask = np.ones(len(row), bool); mask[max(line-6,0):line+6] = False
+mx = np.abs(np.diff(row, axis=0)).max(axis=1)[mask[:-1]].max()
+assert mx < 12, f"diffusion not smooth (max jump {mx})"
+# far from the curve the field returns toward the white background
+far = row[max(line-30,0):max(line-25,0)]
+assert far.mean() > 190, f"diffusion did not fall off to background {far.mean()}"
+print("  PASS: diffusion boundary colors + smooth harmonic gradient + falloff")
+EOF
+check "diffusion solves Poisson correctly" "[ $? -eq 0 ]"
+
+echo "== smazka-solve pipeline =="
+make solve > "$BUILD/t/solve-build.log" 2>&1
+check "smazka-solve builds" "[ $? -eq 0 ]"
+"$BUILD/smazka-solve" examples/solve_demo.smazka "$BUILD/t/solve_demo.out" 2>/dev/null
+python3 - "$BUILD/t/solve_demo.out" <<'EOF'
+import sys, re
+verts = {}
+for ln in open(sys.argv[1]):
+    m = re.match(r'v (\d+) ([\d.-]+) ([\d.-]+)', ln)
+    if m: verts[int(m.group(1))] = (float(m.group(2)), float(m.group(3)))
+v0, v1, v2 = verts[0], verts[1], verts[2]
+d = ((v1[0]-v0[0])**2 + (v1[1]-v0[1])**2) ** 0.5
+assert d >= 49.99, f"min_dist not enforced (d={d})"
+assert 50 <= v2[0] <= 200 and 150 <= v2[1] <= 400, "bbox_clamp not enforced"
+assert abs(2*v0[0] + v1[1] - 80) < 0.1, f"linear_eq not enforced (2*{v0[0]}+{v1[1]}={2*v0[0]+v1[1]})"
+print("  PASS: min_dist + bbox_clamp + linear_eq enforced by resolver")
+EOF
+check "solve pipeline enforces constraints" "[ $? -eq 0 ]"
 
 echo "== binary round-trip =="
 python3 - "$BUILD" "$ROOT" <<'EOF'

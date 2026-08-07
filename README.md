@@ -2,7 +2,7 @@
 
 **A flat, binary-first vector graphics format with embedded LP + convex QP constraint solvers.**
 
-> Version 1.3.1 — Specification, reference rasterizer, resolver, and tooling
+> Version 1.4 — Specification, reference rasterizer, resolver, and tooling
 
 ---
 
@@ -10,7 +10,7 @@
 
 SmazkaVG is a next-generation vector graphics format designed for:
 
-- **Anime/Illustration production** — topology-aware shared edges, diffusion curves, variable-width strokes
+- **Anime/Illustration production** — topology-aware shared edges, Poisson diffusion curves, variable-width strokes with caps/joins
 - **CAD/Web interchange** — deterministic fixed-point arithmetic, compact binary encoding
 - **LLM-friendly editing** — flat Line-ASM textual projection (~50% fewer tokens than JSON/XML)
 - **Code golf / generative art** — a byte-starved dialect compiler (`tools/smazka-golf`)
@@ -42,7 +42,8 @@ SmazkaVG/
 │   └── psolve/                        # LP + convex QP solver (git submodule)
 ├── tools/
 │   ├── smazka-golf.c                  # Code-golf dialect compiler
-│   └── smazka-bin.c                   # Compact delta-VLQ binary container
+│   ├── smazka-bin.c                   # Compact delta-VLQ binary container
+│   └── smazka-solve.c                 # Apply the constraint solver to a file
 ├── examples/
 │   ├── triangle_v1.2.smazka           # Curved-edge face fill
 │   ├── eyelash_v1.2.smazka            # Tapered anime lash + diffusion
@@ -57,17 +58,21 @@ SmazkaVG/
 ```sh
 make && make test
 
-# render an example
+# render an example (PNG + BMP + WebP + SVG + ASCII)
 ./build/smazka-raster examples/curves_v1.3.smazka 512 512
-#   -> curves_v1.3.bmp/.webp/.svg/.txt
+#   -> curves_v1.3.png/.bmp/.webp/.svg/.txt
 
 # resolver self-test (no solver backend)
 ./build/resolver-test
 
-# solver self-test with the real psolve LP/QP backend (10 tests)
+# solver self-test with the real psolve LP/QP backend (11 tests)
 git submodule update --init      # first time only
 make solver-test
 ./build/solver-test
+
+# solve constraints against a file, then render the result
+./build/smazka-solve examples/solve_demo.smazka resolved.smazka
+./build/smazka-raster resolved.smazka 512 512
 
 # golf dialect: one-token shapes, implicit IDs
 ./build/smazka-golf examples/golf_face.sg face.smazka
