@@ -51,11 +51,11 @@
 #define MAX_N   1024
 #define MAX_A   256
 #define MAX_EL  256
-#define MAX_LINE 2048
+#define MAX_LINE 65536  /* v1.6.2: xpanded faces carry hundreds of edge ids */
 #define MAX_W   64
 #define MAX_CON 256     /* s / a / c sections */
 #define MAX_PCON 128    /* p section */
-#define MAX_FE  512     /* edges per face (v1.6: full body loops) */
+#define MAX_FE  1024    /* edges per face (v1.6.2: tessellated body loops) */
 #define MAX_FPTS (MAX_FE * 9 + 4)   /* max tessellated points per face */
 
 typedef struct { double x, y; } V2;
@@ -170,12 +170,18 @@ static int read_dbl(const char **p, double *out) {
 }
 
 /* ─── Main parser ─── */
+#include "xauthor.h"
+
 static int parse(const char *path) {
-    FILE *f = fopen(path, "r");
-    if (!f) { fprintf(stderr, "smazka: error: cannot open '%s'\n", path); return -1; }
+    int xa_errors = 0;
+    char *xbuf = xa_read_expand(path, stderr, &xa_errors);
+    if (!xbuf) { fprintf(stderr, "smazka: error: cannot open '%s'\n", path); return -1; }
+    if (xa_errors)
+        fprintf(stderr, "smazka: warning: %d authoring-layer error(s); check '# xa ERROR' lines\n", xa_errors);
+    char *cur = xbuf;
     char ln[MAX_LINE];
     int lineno = 0;
-    while (fgets(ln, sizeof(ln), f)) {
+    while (xa_line(&cur, ln, sizeof(ln))) {
         lineno++;
         char *nl = strchr(ln, '\n'); if (nl) *nl = 0;
         char *p = ln; while (*p == ' ' || *p == '\t') p++;
@@ -264,6 +270,7 @@ static int parse(const char *path) {
                     if (tok[k] < '0' || tok[k] > '9') { is_pure = 0; break; }
                 if (!is_pure || tl >= 6) {           /* fill color (or unknown) */
                     F->fill = (uint32_t)strtoul(tok, NULL, 16);
+                    if (tl >= 8) F->fill >>= 8;      /* RRGGBBAA: keep RRGGBB, drop alpha */
                     break;
                 }
                 int e = atoi(tok);
@@ -467,7 +474,7 @@ static int parse(const char *path) {
             break;
         }
     }
-    fclose(f);
+    free(xbuf);
     return 0;
 }
 
@@ -1942,6 +1949,8 @@ int main(int argc, char **argv) {
                         "  --out <prefix>          output prefix for the frame sequence\n"
                         "  --loop                  wrap time modulo the animation duration\n"
                         "  --debug-overlay         draw raw edge guides + red vertex markers (authoring aid)\n"
+                        "  --xpand <out.smazka>     expand the authoring skin (path/fobj/group/symbolic ids)\n"
+                        "                        into plain Line-ASM records and exit (use '-' for stdout)\n"
                         "  --view <ox> <oy> <sc>   pin the view transform (pixel-exact mapping; 0 0 1 =\n"
                         "                        document coords are image pixels, no auto-fit margin)\n", argv[0]);
         return 1;
@@ -1951,6 +1960,7 @@ int main(int argc, char **argv) {
     int anim = 0, fps = 12, nframes = 24, loop = 0;
     double t_single = -1.0;
     char out_prefix[560] = "";
+    const char *xpand_out = NULL;
     /* parse [w] [h] positionals then flags */
     int pos = 2;
     if (pos < argc && argv[pos][0] != '-') { w = atoi(argv[pos++]); }
@@ -1961,11 +1971,24 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) { snprintf(out_prefix, sizeof(out_prefix), "%s", argv[i + 1]); i += 1; }
         else if (strcmp(argv[i], "--loop") == 0) { loop = 1; }
         else if (strcmp(argv[i], "--debug-overlay") == 0) { g_debug_overlay = 1; }
+        else if (strcmp(argv[i], "--xpand") == 0 && i + 1 < argc) { xpand_out = argv[i + 1]; i += 1; }
         else if (strcmp(argv[i], "--view") == 0 && i + 3 < argc) {
             fix_ox = atof(argv[i + 1]); fix_oy = atof(argv[i + 2]);
             fix_sc = atof(argv[i + 3]); view_fixed = 1; i += 3;
         }
         else fprintf(stderr, "smazka: ignoring unknown option '%s'\n", argv[i]);
+    }
+    if (xpand_out) {                 /* expand authoring skin -> plain Line-ASM, exit */
+        int nerr = 0;
+        char *x = xa_read_expand(inp, stderr, &nerr);
+        if (!x) { fprintf(stderr, "smazka: xpand: cannot read '%s'\n", inp); return 1; }
+        FILE *of = strcmp(xpand_out, "-") == 0 ? stdout : fopen(xpand_out, "w");
+        if (!of) { fprintf(stderr, "smazka: xpand: cannot write '%s'\n", xpand_out); free(x); return 1; }
+        fwrite(x, 1, strlen(x), of);
+        if (of != stdout) fclose(of);
+        free(x);
+        fprintf(stderr, "xpand: %s -> %s (%d error(s))\n", inp, xpand_out, nerr);
+        return nerr ? 2 : 0;
     }
     if (w < 64) w = 64;
     if (h < 64) h = 64;
@@ -2024,12 +2047,14 @@ int main(int argc, char **argv) {
 
     render();
 
+    /* --out pins the single-frame output prefix too (defaults to input name) */
+    if (!out_prefix[0]) snprintf(out_prefix, sizeof(out_prefix), "%s", base);
     char bmp_p[560], webp_p[560], png_p[560], svg_p[560], txt_p[560];
-    snprintf(bmp_p, sizeof(bmp_p), "%s.bmp", base);
-    snprintf(webp_p, sizeof(webp_p), "%s.webp", base);
-    snprintf(png_p, sizeof(png_p), "%s.png", base);
-    snprintf(svg_p, sizeof(svg_p), "%s.svg", base);
-    snprintf(txt_p, sizeof(txt_p), "%s.txt", base);
+    snprintf(bmp_p, sizeof(bmp_p), "%s.bmp", out_prefix);
+    snprintf(webp_p, sizeof(webp_p), "%s.webp", out_prefix);
+    snprintf(png_p, sizeof(png_p), "%s.png", out_prefix);
+    snprintf(svg_p, sizeof(svg_p), "%s.svg", out_prefix);
+    snprintf(txt_p, sizeof(txt_p), "%s.txt", out_prefix);
 
     write_png(png_p);   fprintf(stderr, "PNG:  %s (%dx%d)\n", png_p, w, h);
     write_bmp(bmp_p);   fprintf(stderr, "BMP:  %s (%dx%d, %d KB)\n", bmp_p, w, h, (54 + w * h * 3) / 1024);

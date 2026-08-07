@@ -66,3 +66,50 @@ measured on a real, month-long manual conversion (anime figure, 1350×2268,
 ## Changed
 - `tests/run_tests.sh` — the node-transform regression (which asserts on the
   red vertex markers) now passes `--debug-overlay`.
+
+---
+
+# v1.6.2 — authoring skin (dialect), lint mode, corruption fixes
+
+The `.smazka` file itself is now the hand-editable artifact: a sugar layer
+(SPEC §7.4) that every reader expands deterministically at parse time.
+
+## Added
+
+- **`src/xauthor.h`** — the authoring-skin expander, wired into
+  `rasterizer.c` `parse()` and `tools/smazka-bin.c` (enc decodes sugar-free
+  containers). Symbolic bare-word ids in all id/reference positions
+  (namespaces v/e/f/s/path/group; decimal tokens always numeric);
+  `path <name> [closed] [seg|catmull] [w=W] [cap=..] [color=..] items..`;
+  `fobj <name> [fill=HEX] [sw=W] [cap=..] [seg|catmull] items..`
+  (implicitly closed, `sw=0` fill-only, auto `s group_id` inside `group`);
+  items are `x,y` points or splices `use|rev` (shared-spine) / `useg|revg`
+  (ghost) of a prior `path`. Seam joins: ≤0.5 px silent, ≤2 px bridge+warn,
+  otherwise an expansion error.
+- **`--xpand <out.smazka>`** rasterizer mode: expand-only lint pass; errors
+  land on stderr and inline as `# xa ERROR` comments.
+- **Id-redefinition guard**: every issued definition is tracked per
+  namespace; redefining an id (e.g. numeric `v 0` after symbol `v a`)
+  is now an expansion error instead of a silent overwrite.
+- **`tests/dialect.smazka` fixture + suite block** (xpand lint, record
+  counts, collision probe, pixel semantics, bin round-trip raster equality).
+
+## Fixed
+
+- **Xpander output corruption on records > 8 KB**: `xa_put` trusted
+  `vsnprintf`'s would-be length, copying bytes never written; and a
+  truncated echo swallowed its newline so the *next* emitted record glued
+  onto a comment tail and vanished for parsers (a dropped vertex looked
+  like a stroke to the origin — the "diagonal from (0,0)" bug).
+- **Face fill byte order**: an 8-hex (`RRGGBBAA`) face fill was stored as
+  raw u32 and resolved like `RRGGBB`, shifting channels (`FFCCCCFF` →
+  `CCCCFF`). Alpha is now dropped at parse.
+- **Plain `f` color vs. edge name**: trailing all-hex tokens (`FF6B6B`)
+  satisfied the bare-name rule and were looked up as symbolic edges —
+  broke old files with hex-letter fills (animation_demo, donut).
+- **OOB write on huge numeric vertex ids** (`v 999999 ...`) in the
+  expander's tracking arrays (segfault, caught by the evil1 probe).
+- **`--out` ignored for single-frame renders** (was frame-sequence-only).
+- `MAX_FE` 512 → 1024 (tessellated body loops exceed 512 boundary edges);
+  e/f/s numeric heads now bump their namespace counters (latent collision
+  with chain-minted ids); test script links `smazka-bin` with `-lm`.

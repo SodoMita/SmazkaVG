@@ -54,6 +54,12 @@ class Doc:
         self.retired = set()
         self.objects = []
         self.warnings = []
+        # dialect emission hooks (emit_dialect):
+        # raw authoring lines placed before all groups (seam paths etc.)
+        self.dialect_preamble = []
+        # (obj_name, loop_index) -> verbatim fobj items string, e.g.
+        # '1052,605 1090,680 useg wrist 1160,1100 ...'; replaces inline points
+        self.dialect_recipes = {}
 
     # ------------------------------------------------------------- strokes
     def st(self, name, dots, w=2.4, smooth=True, closed=False, trim=0.0,
@@ -202,6 +208,76 @@ class Doc:
                     stroke_edge(new_edge(vs[i], vs[i + 1], smooth), w)
 
         out = '\n'.join(L + body) + '\n'
+        if path:
+            with open(path, 'w') as fh:
+                fh.write(out)
+        return out
+
+    # ------------------------------------------------------------- emit preview svg
+    @staticmethod
+    def _pts(pts, prec=1):
+        return ' '.join(f'{x:.{prec}f},{y:.{prec}f}' for x, y in pts)
+
+    def emit_dialect(self, path=None, tess_step=6.0, catmull_knot_cap=40):
+        """Emit the *authoring skin* (.smazka dialect, src/xauthor.h): the
+        hand-editable canonical artifact. Named paths/fobjs/groups preserve
+        the semantic structure -- subsequent fixes happen by editing THIS
+        file, not Python. The rasterizer/bin expand it at parse time
+        (or --xpand for a normalized plain-record copy).
+        Loops with <=catmull_knot_cap knots stay compact 'catmull' chains;
+        larger loops are tessellated inline ('seg') with their authored
+        knots preserved in a provenance comment, so render time stays sane
+        (the face tessellator + ear-clipper budget)."""
+        L = [f'# SmazkaVG authoring skin (v1.6.2) -- {self.W}x{self.H}, '
+             f'{len(self.strokes)} strokes, {len(self.objects)} groups',
+             '# edit here; render via: smazka-raster file.smazka W H --view 0 0 1',
+             '# normalize via: smazka-raster file.smazka --xpand out.smazka']
+        L.extend(self.dialect_preamble)
+        for o in self.objects:
+            L.append(f'group {o.name}')
+            for li, (dots, w, sm, filled) in enumerate(o.loops):
+                sm = o.smooth if sm is None else sm
+                w = o.stroke_w if w is None else w
+                nm = o.name if li == 0 else f'{o.name}_l{li}'
+                key = (o.name, li)
+                base = f'fobj {nm} fill={o.fill or "FFFFFF"} sw={w}'
+                if key in self.dialect_recipes:
+                    et = 'catmull' if sm else 'seg'
+                    L.append(f'{base} {et} {self.dialect_recipes[key]}')
+                    continue
+                if not filled:
+                    et = 'catmull' if sm else 'seg'
+                    L.append(f'path {nm} closed {et} w={w} {self._pts(dots)}')
+                    continue
+                if sm and len(dots) <= catmull_knot_cap:
+                    L.append(f'{base} catmull {self._pts(dots)}')
+                else:
+                    step = self._face_step(dots, sm, target_edges=340, base=tess_step)
+                    pts = geometry.tessellate(dots, smooth=sm, closed=True,
+                                              step=step)
+                    L.append(f'# knots {nm}: {self._pts(dots)}')
+                    L.append(f'{base} seg {self._pts(pts)}')
+            for name in o.inner:
+                s = self.strokes.get(name)
+                if s is None or name in self.retired:
+                    continue
+                em = geometry.trim_ends(s.dots, s.trim) if s.trim else s.dots
+                if s.white:
+                    if s.smooth and len(em) <= catmull_knot_cap:
+                        et, pts = 'catmull', em
+                    else:
+                        et = 'seg'
+                        pts = geometry.tessellate(em, smooth=s.smooth,
+                                                  closed=True, step=tess_step)
+                    L.append(f'fobj {name} fill=FFFFFF sw={s.w} {et} '
+                             f'{self._pts(pts)}')
+                else:
+                    et = 'catmull' if s.smooth else 'seg'
+                    cl = ' closed' if s.closed else ''
+                    cc = f' color={s.color}' if s.color != '000000' else ''
+                    L.append(f'path {name}{cl} {et} w={s.w}{cc} '
+                             f'{self._pts(em)}')
+        out = '\n'.join(L) + '\n'
         if path:
             with open(path, 'w') as fh:
                 fh.write(out)

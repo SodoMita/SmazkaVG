@@ -105,6 +105,11 @@ make solver-test
 #   --debug-overlay     show raw edge guides + red vertex markers (old default)
 ./build/smazka-raster face.smazka 512 512 --view 0 0 1
 
+# authoring skin (v1.6.2): symbolic ids, path/fobj/group, seam splices —
+# the .smazka itself is the hand-edited artifact (SPEC §7.4, AGENTS.md §8)
+./build/smazka-raster tests/dialect.smazka --xpand -      # lint/expand only
+./build/smazka-raster tests/dialect.smazka 480 240 --view 0 0 1 --out build/dialect
+
 # LLM dot-first vectorization workflow (requires python3, Pillow, numpy;
 # cairosvg for the svg preview path) — full manual in AGENTS.md
 make llm-demo   # convert a synthetic line-art source end-to-end

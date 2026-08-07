@@ -19,14 +19,14 @@ all: raster golf bin resolver-test solve
 $(BUILD):
 	mkdir -p $@
 
-raster: $(BUILD) src/rasterizer.c
+raster: $(BUILD) src/rasterizer.c src/xauthor.h
 	$(CC) $(CFLAGS) -o $(BUILD)/smazka-raster src/rasterizer.c -lm
 
 golf: $(BUILD) tools/smazka-golf.c
 	$(CC) $(CFLAGS) -o $(BUILD)/smazka-golf tools/smazka-golf.c -lm
 
-bin: $(BUILD) tools/smazka-bin.c
-	$(CC) $(CFLAGS) -o $(BUILD)/smazka-bin tools/smazka-bin.c
+bin: $(BUILD) tools/smazka-bin.c src/xauthor.h
+	$(CC) $(CFLAGS) -o $(BUILD)/smazka-bin tools/smazka-bin.c -lm
 
 resolver-test: $(BUILD) src/resolver.c
 	$(CC) $(CFLAGS) -DSMZ_STANDALONE -o $(BUILD)/resolver-test src/resolver.c -lm

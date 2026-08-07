@@ -244,3 +244,39 @@ losslessly; `./build/smazka-golf` exists if byte-golfing is the goal.
 Fix the **worst missing tile first** (`verify.run` prints them sorted), one
 region per iteration. Do not "polish globally" before the metric is green;
 global vibes-polish is how previously-correct regions regress unnoticed.
+
+---
+
+## 8. Author directly in `.smazka` (dialect v1.6.2)
+
+The deliverable is the `.smazka` file itself, edited as text — **not** a
+Python script that regenerates it. Python is for *measurement* (`imgscan`)
+and *metrics* (`verify`); authoring happens in the document.
+
+Use the authoring skin (SPEC §7.4):
+
+- **Name things.** `v`/`e`/`f`/`s` take symbolic ids; `path`/`fobj`/`group`
+  bundle geometry under names (`fobj hair_back fill=FFFFFF sw=3 seg …`).
+  Names are what makes an edit diff reviewable.
+- **One `fobj` per closed object**, plain points on one line items. Small
+  smooth loops: `fobj … catmull` through sparse knots. Long tessellated
+  loops: plain `seg` points (~6 px spacing) — face fills chew ≤1024 edges.
+- **Paths are inner strokes**: `path swoosh catmull w=2.2 cap=round …` —
+  no manual `v/e/s` triplet bookkeeping per curve.
+- **Seams are splice references, not retyped coordinates.** Define the seam
+  once (`path wrist seg 1245,1120 1170,1122`) and reference it from both
+  sides: `fobj arm … useg wrist …` / `fobj hand … revg wrist …`. `use/rev`
+  shares the spline's vertices; `useg/revg` ghosts fresh copies. A join of
+  ≤0.5 px is silent, ≤2 px auto-bridges with a warning, more is an
+  expansion error — by design: drifted seams are *louder* than float noise.
+- **Lint before rendering**: `smazka-raster file.smazka --xpand /dev/null` —
+  exit code 0 and no `# xa ERROR` lines means well-formed. Errors are also
+  written inline in the xpanded output, at the position they occurred.
+- **Don't share vertices between catmull chains** (tangents derive from any
+  touching edge — SPEC/AGENTS §1); ghosts (`useg`) exist precisely for that.
+
+Edit loop per fix: measure zone (`imgscan.shade/probe`) → edit the named
+record in the `.smazka` → `--xpand` lint → render `--view 0 0 1` →
+`verify.run` → next worst tile. Numeric ids are fine to mix in (supplement
+automation), just keep them above the name counters; redefinitions are now
+hard errors, not silent overwrites.

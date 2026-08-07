@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include "../src/xauthor.h"
 
 /* ─── VLQ primitives ─────────────────────────────────────────────── */
 
@@ -92,10 +93,14 @@ static void skip_tok(const char **p) {
 /* ─── Encoder ────────────────────────────────────────────────────── */
 
 static int enc(const char *inp, const char *outp) {
-    FILE *in = fopen(inp, "r");
-    if (!in) { fprintf(stderr, "bin: cannot open %s\n", inp); return 1; }
+    /* v1.6.2: expand the authoring skin (path/fobj/group/symbolic ids) at
+       read time; the binary container always stores plain records. */
+    int xa_errors = 0;
+    char *xbuf = xa_read_expand(inp, stderr, &xa_errors);
+    if (!xbuf) { fprintf(stderr, "bin: cannot open %s\n", inp); return 1; }
+    if (xa_errors) fprintf(stderr, "bin: warning: %d authoring error(s)\n", xa_errors);
     FILE *out = fopen(outp, "wb");
-    if (!out) { fprintf(stderr, "bin: cannot write %s\n", outp); return 1; }
+    if (!out) { fprintf(stderr, "bin: cannot write %s\n", outp); free(xbuf); return 1; }
 
     /* header placeholder */
     fwrite("SMVG", 1, 4, out);
@@ -104,8 +109,9 @@ static int enc(const char *inp, const char *outp) {
     long counts_pos = ftell(out);
     for (int i = 0; i < 12; i++) fwrite(&counts[i], 4, 1, out);
 
-    char ln[2048];
-    while (fgets(ln, sizeof(ln), in)) {
+    char ln[65536];
+    char *cur = xbuf;
+    while (xa_line(&cur, ln, sizeof(ln))) {
         char *p = ln;
         while (*p == ' ' || *p == '\t') p++;
         if (!*p || *p == '#') continue;
@@ -343,7 +349,7 @@ static int enc(const char *inp, const char *outp) {
     fseek(out, counts_pos, SEEK_SET);
     for (int i = 0; i < 12; i++) fwrite(&counts[i], 4, 1, out);
     fclose(out);
-    fclose(in);
+    free(xbuf);
     fprintf(stderr, "bin: encoded %s -> %s (v:%u e:%u f:%u s:%u n:%u r:%u z:%u scon:%u acon:%u con:%u p:%u)\n",
             inp, outp, counts[0], counts[1], counts[2], counts[3], counts[4],
             counts[5], counts[6], counts[7], counts[8], counts[10], counts[11]);

@@ -50,6 +50,8 @@
 | v1.4 | Diffusion curves are a real discrete Laplace (Poisson) solve (SOR, bounded, deterministic) instead of a signed-distance brush. Stroke caps (round/butt/square; round caps form round joins). Self-contained PNG output. `tools/smazka-solve` applies the resolver to a file end-to-end. Resolver `rig` QP implemented (translation-only equilibrium). |
 | v1.4.1 | **Node transforms applied**: affine transforms (scale→skew→rotate→translate, node ID order) are baked into the vertex store for vertex/edge content. **Face holes**: `f <outer edges> | <hole edges> [| ...] [fill]` filled with even-odd rule (curved holes tessellated). Parser fixes: fill colors starting with decimal digits (e.g. `88AA00`) parse correctly; inline `#` comments no longer leak into the fill. Binary container encodes/decodes holes and 8-digit face fills. Resolver `rig` switched to psolve's **fixed-point PGS** boxed QP (integer-exact Q16.16). |
 | v1.5 | **Animation**: `k` keyframe records drive node transforms; the rasterizer interpolates per field (piecewise-linear, partial keyframes inherit the node's base pose) and renders **frame sequences** (`--anim <fps> <frames> [--loop] [--out prefix]`) with a fixed camera covering the animation's full bounding box; single frames at a time are rendered with `--t <seconds>`. Animated GIF output is assembled from the PNG frames when PIL is available. Keyframes round-trip through the binary container; golf dialect gains `K`. |
+| v1.6 | LLM authoring toolkit (`tools/llm`: imgscan/geometry/author/verify/selftest), `AGENTS.md` doctrine, `--debug-overlay`, `--view`, record-count caps raised (v/e/s 32768, f 1024, face edges 512), PNG stored-block fix. |
+| v1.6.2 | **Authoring skin** (§7.4): symbolic ids, `path`/`fobj`/`group`, `use`/`rev`/`useg`/`revg` splices with seam tolerance, expanded deterministically by every reader plus `--xpand` lint mode. Id-redefinition guard (numeric↔symbolic collisions are errors). Face edge cap 1024. Fixes: face fill parsed as `RRGGBB` also when written `RRGGBBAA` (was byte-shifted); xpander output corruption on >8 KB records (would-be-length memcpy + swallowed newline); `--out` honored for single frames; OOB write on huge numeric vertex ids. |
 
 ---
 
@@ -758,6 +760,60 @@ number       = ["-"] 1*DIGIT ["." 1*6DIGIT]
 hexcolor     = 3HEXDIG / 6HEXDIG / 8HEXDIG   ; RGB / RRGGBB / RRGGBBAA
 ```
 
+### 7.4 Authoring Records (dialect, v1.6.2)
+
+The *authoring skin* is a sugar layer accepted by every reader (rasterizer,
+`smazka-bin`, `--xpand`). It exists so a hand-edited document — written by a
+human or an LLM — reads like a scene description instead of a heap table.
+Expansion to plain Line-ASM is **deterministic and total**: every authoring
+record becomes ordinary `v`/`e`/`f`/`s` records, and expansion errors are
+reported both on stderr and inline as `# xa ERROR: ...` comment lines.
+
+```abnf
+author-line  = path / fobj / group / symrecord
+symrecord    = vertex / edge / face / stroke      ; where any id field may be a name
+name         = (ALPHA / "_") *(ALNUM / "_")       ; decimal tokens are ALWAYS numeric
+group        = "group" SP name
+path         = "path" SP name [SP "closed"] [SP ("seg" / "catmull")]
+               [SP "w=" number] [SP "cap=" cap] [SP "color=" hexcolor] 1*(SP item)
+fobj         = "fobj" SP name [SP "fill=" hexcolor] [SP "sw=" number]
+               [SP "cap=" cap] [SP ("seg" / "catmull")] 1*(SP item)
+item         = point / splice
+point        = number "," number
+splice       = ("use" / "rev" / "useg" / "revg") SP name   ; of a prior path
+```
+
+Semantics:
+
+- **Symbolic ids.** `v`/`e`/`f`/`s` heads and reference positions accept
+  names; namespaces for v/e/f/s/path/group are separate. Define-before-use.
+  A name mints the next free numeric id at its definition site. Numeric ids
+  occupy the same space: pick them *above* symbol counters when mixing;
+  redefining an already-issued id is an expansion error.
+- **`path`** mints one `v` per point, one `e` between consecutive points
+  (`type=seg` or `type=catmull`), plus one closing edge when `closed`.
+  With `w=W` it also emits one uniform-width stroke `s` per edge
+  (`color` default `000000`, `cap` default `butt`, width `W W`).
+- **`fobj`** is an implicitly closed `path` plus a face `f` over its boundary
+  (`fill` default `FFFFFF`). `sw=0` draws no boundary stroke (fill-only);
+  `sw>0` strokes every boundary edge. Inside a `group`, an
+  `s <id> group_id <fid> <group#>` record is emitted as well.
+- **Splices** reuse geometry across records: `use p` / `rev p` append the
+  edges of path `p` (forward / reversed), *sharing its vertices* (shared
+  spine); `useg p` / `revg p` re-emit its points as **fresh vertices**
+  (ghost copy). If the chain's current point and the splice start differ by
+  ≤ 0.5 px the join is silent, ≤ 2 px bridges with a `seg` + warning, and
+  anything larger is an expansion error (seams must share coordinates).
+- **Seams are exact.** Objects that touch (wrist/hand, torso/head, etc.)
+  splice the *same* named seam path so coordinates are shared or ghosted at
+  sub-pixel tolerance — never retyped by eye.
+- Parsing of plain `f` lines treats a trailing 6/8-hex token as the fill
+  color, never as an edge name; avoid naming edges with pure hex spellings.
+
+`--xpand out.smazka` on the rasterizer CLI performs only the expansion,
+which makes it the lint step for authored files: exit code 0 and no
+`# xa ERROR` lines means the document is well-formed.
+
 ---
 
 ## 8. Profiles & Conformance
@@ -797,7 +853,7 @@ instead of rejecting the whole file, provided it reports the drop.
 | Constraints per section (s/a/c) | 65535 | 256 |
 | Paint records (p) | 65535 | 128 |
 | Stroke width samples | 4096 | 64 |
-| Face edge count | 1024 | 512 |
+| Face edge count | 1024 | 1024 |
 | State machine states | 256 | 256 |
 | Solver iterations | 255 (MAX_ITER) | 64 |
 | Solver wall time | 255 ms (MAX_MS) | 50 ms |
