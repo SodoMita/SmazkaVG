@@ -329,23 +329,64 @@ def _resample(p, n):
     return np.stack([np.interp(t, s, p[:, 0]), np.interp(t, s, p[:, 1])], 1)
 
 
-def check_joins(doc, lo=0.75, hi=3.5):
-    """Endpoints floating near another vertex: intended seams that aren't."""
-    out = []
-    vs = list(doc.verts.values())
-    for s in doc.strokes:
-        e = doc.edges[s.edge]
-        for which, vid in (("start", e.a), ("end", e.b)):
-            pt = doc.verts[vid]
-            for x, y in vs:
-                d = float(np.hypot(pt[0] - x, pt[1] - y))
-                if lo < d <= hi:
-                    out.append(Finding(
-                        "join", f"{s.sid} ({s.record}) {which} sits {d:.1f}px "
-                        f"from vertex ({x:.0f},{y:.0f}) - seam that isn't",
-                        [s], pt))
-                    break
-    return out
+def check_joins(doc, lo=0.75, hi=3.5, max_pairs=400):
+    """Stroke caps floating near ANOTHER stroke's body: seams the author
+    meant and missed. A cap that touches nothing is a legit ending; a cap
+    that hovers 1..3 px off a neighbor's ink is a sliver waiting to show.
+
+    (The naive 'endpoint near any vertex' reading was 2 755 findings of
+    noise: in a tessellated figure every endpoint is near SOME vertex.
+    What matters is another STROKE's ink passing by — that is where the
+    eye will see the gap/overlap.)
+    """
+    from scipy.spatial import cKDTree
+    # ink point cloud per stroke, with stroke index per point
+    clouds, owners = [], []
+    for idx, s in enumerate(doc.strokes):
+        p = np.asarray(s.pts, dtype=float)
+        if len(p) == 0:
+            continue
+        n = min(32, max(4, len(p)))
+        q = _resample(p, n)
+        clouds.append(q)
+        owners.append(np.full(len(q), idx))
+    if not clouds:
+        return []
+    cloud = np.concatenate(clouds)
+    owner = np.concatenate(owners)
+    tree = cKDTree(cloud)
+    out, done = [], set()
+    for idx, s in enumerate(doc.strokes):
+        p = np.asarray(s.pts, dtype=float)
+        if len(p) == 0:
+            continue
+        for which, pt in (("start", p[0]), ("end", p[-1])):
+            hits = tree.query_ball_point(pt, hi)
+            best = None
+            for h in hits:
+                j = owner[h]
+                if j == idx:
+                    continue               # same stroke's own ink
+                jrec = doc.strokes[j].record
+                if jrec == s.record:       # same chain's neighbours
+                    continue
+                d = float(np.hypot(*(cloud[h] - pt)))
+                if lo < d <= hi and (best is None or d < best[0]):
+                    pair = (min(s.sid, doc.strokes[j].sid),
+                            max(s.sid, doc.strokes[j].sid))
+                    best = (d, j, pair)
+            if best is None or best[2] in done:
+                continue
+            done.add(best[2])
+            d, j, _ = best
+            fd = Finding(
+                "join", f"{s.sid} ({s.record}) {which} cap sits {d:.1f}px "
+                f"off {doc.strokes[j].sid} ({doc.strokes[j].record}) - "
+                f"seam that isn't", [s, doc.strokes[j]], tuple(pt))
+            out.append((d, fd))
+    # keep the overlay paintable: widest misses first, capped
+    out.sort(key=lambda t: -t[0])
+    return [fd for _, fd in out[:max_pairs]]
 
 
 def check_stray(doc, src, tol):
@@ -393,42 +434,88 @@ OVERLAY_COLORS = {
 
 
 def write_overlay(doc, findings, path, ghost="D8D8D8"):
-    """Re-emit the artwork ghosted, with flagged strokes painted loud."""
+    """Re-emit the artwork ghosted, with flagged strokes painted loud.
+
+    The core format caps record ids at 32768, so we share vertices by
+    coordinate and paint flagged strokes at coarse sampling; a debug
+    overlay that overflows the parser would show nothing at all.
+    """
     lines = ["# audit overlay - the format displaying its own garbage",
              "# {doctype smazka overlay}", ""]
     nv = 0
     ne = 0
+    vcache = {}
 
     def emit_v(x, y):
         nonlocal nv
-        nv += 1
-        lines.append(f"v {nv} {x:.2f} {y:.2f}")
-        return nv
+        key = (round(x * 4), round(y * 4))
+        vid = vcache.get(key)
+        if vid is None:
+            nv += 1
+            lines.append(f"v {nv} {x:.2f} {y:.2f}")
+            vcache[key] = vid = nv
+        return vid
 
-    for s in doc.strokes:                        # ghost: thin silver
+    def emit_chain(pts, n, color, w, tag):
+        nonlocal ne
+        p = np.asarray(pts, dtype=float)
+        if len(p) == 0:
+            return
+        q = _resample(p, min(n, max(2, len(p))))
         prev = None
-        for x, y in s.pts[::max(1, len(s.pts) // 40)]:
+        for x, y in q:
             vid = emit_v(x, y)
             if prev is not None:
                 ne += 1
                 lines.append(f"e {ne} {prev} {vid}")
-                lines.append(f"s g{ne} {ne} {ghost} 1.8")
+                lines.append(f"s {tag}{ne} {ne} {color} {w:.2f}")
             prev = vid
+
+    # merge per-edge strokes into per-record chains first; without this a
+    # tessellated figure mints ~80k overlay ids and the parser (32768 cap)
+    # silently drops the findings themselves
+    def record_chains(strokes):
+        chains, order = {}, []
+        for s in strokes:
+            if s.record not in chains:
+                chains[s.record] = []
+                order.append(s.record)
+            chains[s.record].append(s)
+        for rec in order:
+            pts = []
+            for s in chains[rec]:
+                p = [tuple(q) for q in s.pts]
+                if pts and p and np.hypot(pts[-1][0] - p[0][0],
+                                          pts[-1][1] - p[0][1]) < 0.5:
+                    p = p[1:]
+                pts.extend(p)
+            yield rec, pts
+
+    for rec, pts in record_chains(doc.strokes):       # ghost: thin silver
+        if len(pts) >= 2:
+            st = max(1, len(pts) // 24)
+            emit_chain(pts[::st], 2000, ghost, 1.8, "g")
     flagged = {}
-    for fd in findings:
+    prio = {"stray": 0, "dup": 1, "join": 2, "degen": 2, "hidden": 3}
+    order = sorted(findings, key=lambda f: prio.get(f.kind, 4))
+    for fd in order:
         for s in fd.strokes:
             flagged.setdefault(s.sid, (s, fd.kind))
     lines.append("")
+    by_rec = {}
     for s, kind in flagged.values():
-        col = OVERLAY_COLORS[kind]
-        prev = None
-        for x, y in s.pts[::max(1, len(s.pts) // 48)]:
-            vid = emit_v(x, y)
-            if prev is not None:
-                ne += 1
-                lines.append(f"e {ne} {prev} {vid}")
-                lines.append(f"s f{ne} {ne} {col} {s.w + 2.5:.1f}")
-            prev = vid
+        by_rec.setdefault((s.record, kind), []).append(s)
+    for (rec, kind), ss in by_rec.items():
+        w = max(x.w for x in ss) + 2.5
+        if kind in ("join", "degen"):   # point the finger, not the whole arm
+            for s in ss:
+                if len(s.pts) >= 2:
+                    emit_chain(s.pts, 12, OVERLAY_COLORS[kind], w, "f")
+            continue
+        for _, pts in record_chains(ss):
+            if len(pts) >= 2:
+                st = max(1, len(pts) // 28)
+                emit_chain(pts[::st], 2000, OVERLAY_COLORS[kind], w, "f")
     with open(path, "w") as fh:
         fh.write("\n".join(lines) + "\n")
 
