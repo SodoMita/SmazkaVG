@@ -16,14 +16,15 @@ Edit-friendliness doctrine (do NOT violate without being asked):
   * every object = ONE closed single-line loop (plus inner detail strokes)
   * smooth=True only for smooth strands; fingers/zigzag detail = smooth=False
 """
+import math
 from . import geometry
 
 
 class Stroke:
-    __slots__ = ('name', 'dots', 'w', 'smooth', 'closed', 'trim', 'color')
+    __slots__ = ('name', 'dots', 'w', 'smooth', 'closed', 'trim', 'color', 'white')
 
     def __init__(self, name, dots, w=2.4, smooth=True, closed=False,
-                 trim=0.0, color='000000'):
+                 trim=0.0, color='000000', white=False):
         self.name = name
         self.dots = list(dots)
         self.w = float(w)
@@ -31,6 +32,7 @@ class Stroke:
         self.closed = closed
         self.trim = float(trim)
         self.color = color
+        self.white = white        # closed + white-filled mini object (petal/iris)
 
 
 class Obj:
@@ -55,10 +57,11 @@ class Doc:
 
     # ------------------------------------------------------------- strokes
     def st(self, name, dots, w=2.4, smooth=True, closed=False, trim=0.0,
-           color='000000'):
+           color='000000', white=False):
         if name in self.strokes:
             self.warnings.append(f'DUP stroke name {name} (overwritten)')
-        self.strokes[name] = Stroke(name, dots, w, smooth, closed, trim, color)
+        self.strokes[name] = Stroke(name, dots, w, smooth, closed, trim, color,
+                                    white)
         return name
 
     def retire(self, *names):
@@ -96,16 +99,22 @@ class Doc:
     # ------------------------------------------------------------- objects
     def obj(self, name, loops=(), inner=(), fill='FFFFFF', stroke_w=3.0,
             smooth=True):
-        """loops items: (dots, w|None, smooth|None) | (dots, w) | dots."""
+        """loops items:
+          (dots, w, smooth, filled)  -- explicit; filled=True -> closed face
+          (dots, w|None, smooth|None) | (dots, w) | dots
+        loops[0] is the outer loop (closed face). Inner detail strokes go on
+        top via inner=[stroke names]."""
         norm = []
-        for lp in loops:
-            if isinstance(lp, tuple) and len(lp) == 3:
-                norm.append((list(lp[0]), lp[1], lp[2]))
+        for k, lp in enumerate(loops):
+            if isinstance(lp, tuple) and len(lp) == 4:
+                norm.append((list(lp[0]), lp[1], lp[2], lp[3]))
+            elif isinstance(lp, tuple) and len(lp) == 3:
+                norm.append((list(lp[0]), lp[1], lp[2], k == 0))
             elif isinstance(lp, tuple) and len(lp) == 2 and \
                     isinstance(lp[1], (int, float)):
-                norm.append((list(lp[0]), lp[1], None))
+                norm.append((list(lp[0]), lp[1], None, k == 0))
             else:
-                norm.append((list(lp), None, None))
+                norm.append((list(lp), None, None, k == 0))
         self.objects.append(Obj(name, norm, list(inner), fill, stroke_w, smooth))
         return name
 
@@ -172,8 +181,9 @@ class Doc:
             if len(dots) < 2:
                 continue
             if kind == 'face':
+                step = self._face_step(dots, smooth)
                 tess = geometry.tessellate(dots, smooth=smooth, closed=True,
-                                           step=tess_step)
+                                           step=step)
                 if len(tess) < 3:
                     continue
                 vs = [new_vert(x, y) for x, y in tess]
@@ -182,8 +192,9 @@ class Doc:
                 body.append(f'f {fid} ' + ' '.join(map(str, es))
                             + ' ' + (fill or 'FFFFFF'))
                 fid += 1
-                for e in es:
-                    stroke_edge(e, w)
+                if w > 0:
+                    for e in es:
+                        stroke_edge(e, w)
             else:
                 seq = dots + ([dots[0]] if closed else [])
                 vs = [new_vert(x, y) for x, y in seq]
@@ -217,17 +228,21 @@ class Doc:
         for o in self.objects:
             P.append(f'<g id="{o.name}">')
             for kind, dots, w, smooth, closed, fill in self._draw_items_for(o):
+                step = self._face_step(dots, smooth) if kind == 'face' else tess_step
                 tess = geometry.tessellate(dots, smooth=smooth, closed=closed,
-                                           step=tess_step)
+                                           step=step)
                 d = d_of(tess, closed)
                 if not d:
                     continue
                 if kind == 'face':
-                    P.append(f'<path d="{d}" fill="#{fill}" stroke="#000" '
-                             f'stroke-width="{w}" stroke-linejoin="round" '
-                             f'stroke-linecap="round"/>')
+                    if w > 0:
+                        P.append(f'<path d="{d}" fill="#{fill}" stroke="#000" '
+                                 f'stroke-width="{w}" stroke-linejoin="round" '
+                                 f'stroke-linecap="round"/>')
+                    else:
+                        P.append(f'<path d="{d}" fill="#{fill}" stroke="none"/>')
                 else:
-                    P.append(f'<path d="{d}" fill="none" stroke="#000" '
+                    P.append(f'<path d="{d}" fill="none" stroke="#{fill or "000000"}" '
                              f'stroke-width="{w}" stroke-linejoin="round" '
                              f'stroke-linecap="round"/>')
             P.append('</g>')
@@ -240,19 +255,30 @@ class Doc:
 
     def _draw_items_for(self, o):
         items = []
-        if o.loops:
-            dots, w, sm = o.loops[0]
+        for dots, w, sm, filled in o.loops:
             sm = o.smooth if sm is None else sm
             w = o.stroke_w if w is None else w
-            items.append(('face', dots, w, sm, True, o.fill))
-            for d2, w2, sm2 in o.loops[1:]:
-                w2 = o.stroke_w if w2 is None else w2
-                sm2 = o.smooth if sm2 is None else sm2
-                items.append(('line', d2, w2, sm2, False, None))
+            if filled:
+                items.append(('face', dots, w, sm, True, o.fill))
+            else:
+                items.append(('line', dots, w, sm, False, None))
         for name in o.inner:
             s = self.strokes.get(name)
             if s is None or name in self.retired:
                 continue
             em = geometry.trim_ends(s.dots, s.trim) if s.trim else s.dots
-            items.append(('line', em, s.w, s.smooth, s.closed, None))
+            if s.white:
+                items.append(('face', em, s.w, s.smooth, True, 'FFFFFF'))
+            else:
+                items.append(('line', em, s.w, s.smooth, s.closed, s.color))
         return items
+
+    @staticmethod
+    def _face_step(dots, smooth, target_edges=480, base=6.0):
+        """Adaptive tessellation step so a face stays below the rasterizer's
+        MAX_FE edges/face while following the loop tightly."""
+        per = 0.0
+        seq = list(dots) + [dots[0]]
+        for i in range(1, len(seq)):
+            per += math.hypot(seq[i][0] - seq[i - 1][0], seq[i][1] - seq[i - 1][1])
+        return max(base, per / target_edges)

@@ -22,25 +22,25 @@ Pt = tuple  # (x, y) float/int
 
 # ---------------------------------------------------------------- sampling
 def arclen_resample(pts, step=8.0, closed=False):
-    """Resample a polyline to roughly uniform spacing (for tessellation)."""
+    """Resample a polyline so no span exceeds ~step px. Every authored knot
+    is preserved in the output (phase resets per segment): two objects that
+    share an exact coordinate run (a butt seam) keep every seam dot on both
+    of their tessellated outlines."""
     if len(pts) < 2:
         return list(pts)
-    src = list(pts) + ([pts[0]] if closed else [])
-    out = [src[0]]
-    acc = 0.0
-    px, py = src[0]
-    for q in src[1:]:
-        qx, qy = q
-        d = math.hypot(qx - px, qy - py)
-        while acc + d >= step and d > 0:
-            t = (step - acc) / d
-            nx, ny = px + t * (qx - px), py + t * (qy - py)
-            out.append((nx, ny))
-            px, py, d = nx, ny, math.hypot(qx - nx, qy - ny)
-            acc = 0.0
-        acc += d
-        px, py = qx, qy
-    out.append(src[-1])
+    seq = list(pts) + ([pts[0]] if closed else [])
+    out = [seq[0]]
+    for i in range(1, len(seq)):
+        ax, ay = seq[i - 1]
+        bx, by = seq[i]
+        L = math.hypot(bx - ax, by - ay)
+        if L < 1e-9:
+            continue
+        n = int(L // step)
+        for k in range(1, n + 1):
+            t = k * step / L
+            out.append((ax + t * (bx - ax), ay + t * (by - ay)))
+        out.append((bx, by))
     if closed:
         out = out[:-1]
     return out

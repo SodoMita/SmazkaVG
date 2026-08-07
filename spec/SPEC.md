@@ -788,16 +788,16 @@ instead of rejecting the whole file, provided it reports the drop.
 
 | Parameter | Spec maximum | Reference rasterizer (enforced) |
 |---|---|---|
-| Vertices | 65535 | 4096 |
-| Edges | 65535 | 4096 |
-| Faces | 65535 | 4096 |
-| Strokes | 65535 | 4096 |
+| Vertices | 65535 | 32768 |
+| Edges | 65535 | 32768 |
+| Faces | 65535 | 1024 |
+| Strokes | 65535 | 32768 |
 | Nodes | 65535 | 1024 |
 | Arcs / Ellipses | 65535 | 256 |
 | Constraints per section (s/a/c) | 65535 | 256 |
 | Paint records (p) | 65535 | 128 |
 | Stroke width samples | 4096 | 64 |
-| Face edge count | 1024 | 64 |
+| Face edge count | 1024 | 512 |
 | State machine states | 256 | 256 |
 | Solver iterations | 255 (MAX_ITER) | 64 |
 | Solver wall time | 255 ms (MAX_MS) | 50 ms |

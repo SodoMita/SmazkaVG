@@ -44,10 +44,10 @@
 #include <sys/wait.h>
 
 /* ─── Limits (documented in SPEC.md §9) ─── */
-#define MAX_V   4096
-#define MAX_E   4096
-#define MAX_F   4096
-#define MAX_S   4096
+#define MAX_V   32768   /* v1.6: raised for whole-figure LLM conversion docs */
+#define MAX_E   32768
+#define MAX_F   1024
+#define MAX_S   32768
 #define MAX_N   1024
 #define MAX_A   256
 #define MAX_EL  256
@@ -55,7 +55,7 @@
 #define MAX_W   64
 #define MAX_CON 256     /* s / a / c sections */
 #define MAX_PCON 128    /* p section */
-#define MAX_FE  64      /* edges per face */
+#define MAX_FE  512     /* edges per face (v1.6: full body loops) */
 #define MAX_FPTS (MAX_FE * 9 + 4)   /* max tessellated points per face */
 
 typedef struct { double x, y; } V2;
@@ -1673,7 +1673,15 @@ static void write_png(const char *path) {
     fwrite(zl, 1, 2, f);
     c = crc32_raw(c, zl, 2);
 
-    uint8_t tmp[65536];
+    /* v1.6 fix: emit stored blocks of EXACTLY 65535 bytes (last one shorter)
+       so the precomputed nblocks/idat_len always match the actual stream.
+       The old row-triggered flush sliced blocks at buffer boundaries, which
+       produced more blocks than idat_len claimed on large frames (broken
+       PNG when (1+FW*3)*FH got big, e.g. a 1350x2268 reference frame). */
+    size_t rowb = (size_t)1 + (size_t)FW * 3;
+    size_t cap = (size_t)65535 + rowb + 8;
+    uint8_t *tmp = (uint8_t *)malloc(cap);
+    if (!tmp) { fclose(f); return; }
     size_t used = 0;
     uint32_t adler_a = 1, adler_b = 0;   /* adler32 of the raw (filtered) stream */
     uint64_t written = 0;                /* bytes of raw stream emitted so far */
@@ -1681,7 +1689,7 @@ static void write_png(const char *path) {
         tmp[used++] = 0;                 /* filter: None */
         adler_a = (adler_a + 0) % 65521;
         adler_b = (adler_b + adler_a) % 65521;
-        int o = y * FW * 3;
+        long long o = (long long)y * FW * 3;
         for (int x = 0; x < FW; x++) {
             tmp[used++] = fb[o + x * 3];
             adler_a = (adler_a + fb[o + x * 3]) % 65521;
@@ -1693,27 +1701,22 @@ static void write_png(const char *path) {
             adler_a = (adler_a + fb[o + x * 3 + 2]) % 65521;
             adler_b = (adler_b + adler_a) % 65521;
         }
-        if (used + 1 + (size_t)FW * 3 > sizeof(tmp) || y == FH - 1) {
-            /* flush a stored block */
-            size_t len = used;
-            uint8_t *p = tmp;
-            while (len > 0) {
-                size_t chunk = len > 65535 ? 65535 : len;
-                int final = (written + chunk == raw_len) ? 1 : 0;
-                uint8_t bh[5] = { (uint8_t)final,
-                                  (uint8_t)(chunk & 0xFF), (uint8_t)((chunk >> 8) & 0xFF),
-                                  (uint8_t)((~chunk) & 0xFF), (uint8_t)((~(chunk >> 8)) & 0xFF) };
-                fwrite(bh, 1, 5, f);
-                c = crc32_raw(c, bh, 5);
-                fwrite(p, 1, chunk, f);
-                c = crc32_raw(c, p, chunk);
-                p += chunk;
-                len -= chunk;
-                written += chunk;
-            }
-            used = 0;
+        while (used >= 65535 || (y == FH - 1 && used > 0)) {
+            size_t chunk = used >= 65535 ? 65535 : used;
+            int final = (written + chunk == (uint64_t)raw_len) ? 1 : 0;
+            uint8_t bh[5] = { (uint8_t)final,
+                              (uint8_t)(chunk & 0xFF), (uint8_t)((chunk >> 8) & 0xFF),
+                              (uint8_t)((~chunk) & 0xFF), (uint8_t)((~(chunk >> 8)) & 0xFF) };
+            fwrite(bh, 1, 5, f);
+            c = crc32_raw(c, bh, 5);
+            fwrite(tmp, 1, chunk, f);
+            c = crc32_raw(c, tmp, chunk);
+            written += chunk;
+            used -= chunk;
+            if (used) memmove(tmp, tmp + chunk, used);
         }
     }
+    free(tmp);
     uint32_t adler = (adler_b << 16) | adler_a;
     uint8_t tr[4] = { (uint8_t)(adler >> 24), (uint8_t)(adler >> 16), (uint8_t)(adler >> 8), (uint8_t)adler };
     fwrite(tr, 1, 4, f);

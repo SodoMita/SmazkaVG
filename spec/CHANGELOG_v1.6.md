@@ -40,6 +40,23 @@ measured on a real, month-long manual conversion (anime figure, 1350×2268,
 - **`--debug-overlay`** — raw 1.5 px edge guides and red vertex markers are
   now opt-in instead of baked into every render/SVG. Clean images by default.
 
+## Fixed
+- **`write_png` block slicing** — stored-deflate blocks are now emitted in
+  exact 65535-byte units, so the precomputed `IDAT` length always matches the
+  actual stream. The old row-triggered flush produced more blocks than the
+  header claimed and corrupted every PNG with a larger frame (e.g. a
+  1350×2268 reference image would not decode at all).
+- **Polyline tessellation dropped authored knots** (`tools/llm/geometry.py`) —
+  every knot is now preserved (phase resets per segment), which is what makes
+  exact-coordinate butt seams survivable through tessellation.
+- **Raised document caps for whole-figure conversions** (SPEC §9.1):
+  V/E/S 4096→32768, F 4096→1024, edges-per-face 64→512. A real hand-authored
+  figure (~450 strokes, body loops of hundreds of points) previously fell
+  over the parser limits with warnings and dropped records.
+- **`tools/llm/author.py`** — `st(..., white=True)` closed white micro-objects
+  (iris rings, petals); object loops support filled extras + `w=0` fill-only
+  silhouettes; face tessellation is adaptive to stay under the 512-edge cap.
+
 ### Examples & build
 - **`examples/llm_workflow_demo/`** — synthetic line-art source converted
   end-to-end by the toolkit (`run.sh`); scores tol6 P≈0.98 / C≈0.97 via the
