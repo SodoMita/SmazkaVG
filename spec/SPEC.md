@@ -1,10 +1,10 @@
 # SmazkaVG v1.3 Formal Specification
 
 > Flat Document Model · LP + Convex QP Solver · Fixed-Point Determinism
-> Revision 1.3.1 — 2026-08-07
+> Revision 1.3.2 — 2026-08-07
 > Supersedes v1.1 (SMT-era) and v1.2 (namespace split). This revision
 > documents the reference rasterizer (`src/rasterizer.c`) and resolver
-> (`src/resolver.c`) as shipped.
+> (`src/resolver.c`) as shipped, including the psolve LP/QP backend.
 
 ---
 
@@ -45,6 +45,7 @@
 | v1.2 | SMT removed (non-convex, undecidable in general). Namespace split into `s`/`a`/`c`/`p`. Cubic Bézier + B-spline + Spiro edges. Variable-width stroke profiles. Cyclic parent = equilibrium rigging (convex QP). Unified RGBA. Labeled node fields. Convex-QP enforcement at parse time. |
 | v1.3 | Reference rasterizer: per-pixel distance-field rendering (no tessellation). Curve types extended: `quad`, `rational` (conic), `catmull`. New primitives: `r` arc, `z` ellipse. Vertex types (`corner`/`smooth`/`symmetric`/`auto`). Face inline fill field. View-fit includes control points. WebP export. |
 | v1.3.1 | Audit pass: parser bounds-checking, ear-clipping face fills, true taper rendering, curve-aware diffusion brush, resolver fixes (cycle detection, state-machine activation, SLP min_dist). |
+| v1.3.2 | psolve integration: submodule + `libpsolve.a`; resolver LP/QP phases implemented (L1 least-change, SLP with post-solve check, fair_blend/min_stretch QPs); `make solver-test` with 10-test self-suite. |
 
 ---
 
@@ -435,9 +436,10 @@ solver uses **sequential linear programming (SLP)**:
 
 The v1.1 relaxation — adding `x_a − x_b ≥ d/√2` **and** `y_a − y_b ≥ d/√2`
 simultaneously — is **removed**: it forced prim_a to always sit strictly NE of
-prim_b, making feasible layouts infeasible. Exact L2 separation needs SOCP/MIP,
-which is out of scope for the pure-LP backend and documented as a known
-limitation.
+prim_b, making feasible layouts infeasible. The reference resolver also adds a
+post-solve satisfaction check so a satisfied constraint is not re-perturbed by
+the least-change objective. Exact L2 separation needs SOCP/MIP, which is out of
+scope for the pure-LP backend and documented as a known limitation.
 
 ### 5.5 Constraints (c) — convex QP
 
@@ -503,9 +505,22 @@ ELIF section == a:    validate (edge_connects), clamp (bound_check),
                       simulate (state_machine) at current frame
 ELIF section == c:
     IF subtype <= 0x06:  accumulate into LP -> solve with psolve (SLP for min_dist)
-    ELIF subtype >= 0x11: accumulate into QP -> active-set over psolve
+    ELIF subtype >= 0x11: accumulate into QP -> psolve active-set (bounds as rows)
 ELIF section == p:    route to rasterizer (never solved)
 ```
+
+**Reference backend.** The shipped resolver (`src/resolver.c`) links the
+[psolve](https://github.com/SodoMita/psolve) solver, vendored as a git submodule
+(`third_party/psolve`); build with `make solver-test` (defines
+`SMZ_HAVE_PSOLVE`).  LP variables are `2V` vertex coordinates plus `S` stroke
+widths; the LP objective is **L1 least-change** against the document input
+(auxiliary deviation pairs), so a feasible document resolves to the solution
+closest to the input.  `min_dist` / `collision_free` run the SLP loop
+(§5.4.1) with a post-solve satisfaction check.  The QP phase solves
+`fair_blend` (max-entropy weights) and `min_stretch` (elastic pull) per
+constraint; `min_curvature` / `ik_target` / `rig` remain documented stubs
+(§11.1).  All psolve calls are wrapped in the library's `psolve_try`/`psolve_end`
+error protocol so an out-of-memory inside the solver unwinds cleanly.
 
 ### 6.3 Resolution Order (deterministic)
 

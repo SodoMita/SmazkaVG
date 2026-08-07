@@ -30,14 +30,16 @@ SmazkaVG is a next-generation vector graphics format designed for:
 ```
 SmazkaVG/
 ├── README.md                          # This file
-├── Makefile                           # make / make test
+├── Makefile                           # make / make test / make solver-test
 ├── spec/
 │   ├── SPEC.md                        # Formal specification (v1.3)
 │   ├── CHANGELOG_v1.2.md              # v1.1 -> v1.2 changelog
 │   └── CHANGELOG_v1.3.md              # v1.2 -> v1.3 / v1.3.1 changelog
 ├── src/
 │   ├── rasterizer.c                   # Reference rasterizer (BMP/WebP/SVG/ASCII)
-│   └── resolver.c                     # Constraint resolver (compilable, self-test)
+│   └── resolver.c                     # Constraint resolver (LP/QP via psolve)
+├── third_party/
+│   └── psolve/                        # LP + convex QP solver (git submodule)
 ├── tools/
 │   ├── smazka-golf.c                  # Code-golf dialect compiler
 │   └── smazka-bin.c                   # Compact delta-VLQ binary container
@@ -47,7 +49,7 @@ SmazkaVG/
 │   ├── curves_v1.3.smazka             # All curve types + arc + ellipse
 │   └── golf_face.sg / golf_face.smazka# Golf dialect demo
 └── tests/
-    └── run_tests.sh                   # Build + hardening + regression + round-trip
+    └── run_tests.sh                   # Build + hardening + regression + solver + round-trip
 ```
 
 ## Quick Start
@@ -59,8 +61,13 @@ make && make test
 ./build/smazka-raster examples/curves_v1.3.smazka 512 512
 #   -> curves_v1.3.bmp/.webp/.svg/.txt
 
-# resolver self-test
+# resolver self-test (no solver backend)
 ./build/resolver-test
+
+# solver self-test with the real psolve LP/QP backend (10 tests)
+git submodule update --init      # first time only
+make solver-test
+./build/solver-test
 
 # golf dialect: one-token shapes, implicit IDs
 ./build/smazka-golf examples/golf_face.sg face.smazka
@@ -108,8 +115,15 @@ p 0 diffusion 1 L FFE0D0 R 4A3020
      └───────────────┘ └──────────┘ └─────────────┘
 ```
 
-The LP solver is provided by [psolve](https://github.com/SodoMita/psolve) (AVX-512 revised simplex) when
-`SMZ_HAVE_PSOLVE` is defined; without it the resolver compiles as a reference with a passing self-test.
+The LP/QP backend is [psolve](https://github.com/SodoMita/psolve) (AVX-512
+revised-simplex LP + active-set convex QP), vendored as a git submodule
+(`third_party/psolve`, `git submodule update --init`).  With `SMZ_HAVE_PSOLVE`
+defined the resolver's LP phase solves `min_dist` (sequential LP), `bbox_clamp`,
+`linear_*`, and `collision_free` with an L1 least-change objective, and the QP
+phase solves `fair_blend` / `min_stretch` via psolve's active-set solver
+(bounds as rows).  Without it the resolver compiles as a reference with a
+passing self-test.  `make solver-test` builds the psolve-backed binary; the
+self-test then runs 10 checks including real LP and QP solves.
 
 ## Security notes (v1.3.1)
 

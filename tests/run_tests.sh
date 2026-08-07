@@ -52,6 +52,28 @@ rc=$?
 check "resolver self-test passes" "[ $rc -eq 0 ]"
 check "resolver reports all tests" "grep -q 'ALL RESOLVER TESTS PASSED' '$BUILD/t/resolver.out'"
 
+echo "== solver self-test (psolve backend) =="
+if [ -d "$ROOT/third_party/psolve" ]; then
+    make solver-test > "$BUILD/t/solver-build.log" 2>&1
+    rc=$?
+    if [ $rc -eq 0 ]; then
+        ok "solver-test builds (psolve submodule)"
+    else
+        bad "solver-test builds (psolve submodule)"; tail -5 "$BUILD/t/solver-build.log"
+    fi
+    if [ -x "$BUILD/solver-test" ]; then
+        "$BUILD/solver-test" > "$BUILD/t/solver.out" 2>&1
+        rc=$?
+        check "solver self-test passes (10 tests incl. LP/QP)" "[ $rc -eq 0 ]"
+        check "solver tests LP bbox (test6)" "grep -q 'PASS test6' '$BUILD/t/solver.out'"
+        check "solver tests LP min_dist SLP (test8)" "grep -q 'PASS test8' '$BUILD/t/solver.out'"
+        check "solver tests QP fair_blend (test9)" "grep -q 'PASS test9' '$BUILD/t/solver.out'"
+        check "solver tests QP min_stretch (test10)" "grep -q 'PASS test10' '$BUILD/t/solver.out'"
+    fi
+else
+    echo "  SKIP: psolve submodule not checked out (git submodule update --init)"
+fi
+
 echo "== golf dialect =="
 "$BUILD/smazka-golf" examples/golf_face.sg "$BUILD/t/golf.smazka"
 check "golf expands" "[ -s '$BUILD/t/golf.smazka' ]"

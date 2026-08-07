@@ -181,6 +181,39 @@ min_dist semantics, and the tools (§11.2 binary container, §11.3 golf dialect)
 
 ---
 
+---
+
+## v1.3.2 — psolve integration (the LP/QP backend is now real)
+
+**Problem:** SPEC.md and the resolver claimed psolve as the solver backend,
+but the LP/QP phases in `src/resolver.c` were pseudocode stubs: nothing was
+ever linked or solved. psolve also had no library build target, so there was
+no artifact to link against.
+
+**Fix:**
+- psolve's Makefile gained `make lib` / `liblp` / `libqp` (static archives;
+  `libpsolve.a` covers LP + QP + MIP).
+- psolve is vendored as a git submodule (`third_party/psolve`,
+  `git submodule update --init`).
+- `src/resolver.c` now implements the LP phase against psolve's sparse-CSC
+  API: variables are 2V vertex coordinates + S stroke widths; the objective
+  is **L1 least-change** (auxiliary deviation pairs); `min_dist` and
+  `collision_free` run sequential linear programming with a post-solve
+  satisfaction check; `bbox_clamp` maps to variable bounds; `linear_*` map to
+  rows. The QP phase solves `fair_blend` (max-entropy weights) and
+  `min_stretch` (elastic pull) per constraint with psolve's active-set solver,
+  expressing bounds as `Ax ≤ b` rows.
+- All psolve calls are wrapped in `psolve_try()`/`psolve_end()` (the library
+  aborts on OOM unless a handler is installed).
+- `make solver-test` builds the psolve-backed binary; the self-test grows to
+  10 checks, including real solves: LP bbox (L1 projection), LP linear
+  equality (unique L1 optimum), LP min_dist SLP separation, QP fair_blend
+  weights, QP min_stretch with bounds.
+- SPEC.md §6 documents the reference backend and the honest stubs
+  (`min_curvature` / `ik_target` / `rig`).
+
+---
+
 ## Summary
 
 | Aspect | v1.2 | v1.3 / v1.3.1 |

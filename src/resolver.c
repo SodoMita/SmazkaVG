@@ -2,43 +2,50 @@
  * SmazkaVG v1.3 — Constraint Resolver (reference implementation)
  * ==============================================================
  *
- * This file resolves a SmazkaVG document's flat constraint list into a
- * concrete scene: hierarchy (s), assertions & automata (a), continuous
- * optimization (c: LP + convex QP), and paint routing (p).
+ * Resolves a SmazkaVG document's flat constraint list into a concrete
+ * scene: hierarchy (s), assertions & automata (a), continuous optimization
+ * (c: LP + convex QP), and paint routing (p).
  *
- * Model (v1.2+):
- *   - The constraint language is restricted to the decidable, convex,
- *     polynomial-time fragment: LP + convex QP only.  No general SMT.
- *   - Four typed sections, each with a distinct type tag:
- *       0x10  s  structural   (parent, group_id)              -> scene graph
- *       0x20  a  assertions   (edge_connects, bound_check,
- *                              state_machine)                 -> validation/automata
- *       0x30  c  constraints  (min_dist, bbox_clamp, linear_*,
- *                              collision_free, min_curvature,
- *                              ik_target, fair_blend, ...)    -> LP / convex QP
- *       0x40  p  paint        (diffusion, solid_fill, ...)    -> rasterizer (not solved)
+ * Model (v1.2+): the constraint language is restricted to the decidable,
+ * convex, polynomial-time fragment — LP + convex QP only, in four typed
+ * sections (s/a/c/p, tags 0x10-0x40).  Non-convex QP is a parse error.
+ * Every loop is bounded by MAX_ITER / MAX_MS.
  *
- * Termination guarantee: every loop is bounded by MAX_ITER / MAX_MS (header
- * solver_config).  Non-convex QP is rejected at parse time (see SPEC.md).
+ * LP/QP backends: psolve (https://github.com/SodoMita/psolve), vendored as a
+ * submodule under third_party/psolve.  Build the psolve-backed binary with
  *
- * The LP/QP kernels are provided by psolve (https://github.com/SodoMita/psolve)
- * when SMZ_HAVE_PSOLVE is defined.  Without it, the LP/QP phases compile as
- * no-ops so the file remains a compilable reference.  Build a self-test:
+ *   make -C third_party/psolve lib          # -> libpsolve.a
+ *   make solver-test                        # from the repo root
  *
- *   cc -O2 -DSMZ_STANDALONE -o resolver-test src/resolver.c -lm && ./resolver-test
+ * Without SMZ_HAVE_PSOLVE the file compiles as a reference: LP/QP phases
+ * become counting no-ops and the self-test covers the non-solver logic.
+ * All psolve calls are wrapped in psolve_try()/psolve_end() so an OOM
+ * inside the solver unwinds cleanly instead of aborting the host process.
  *
- * v1.3.1 (audit pass):
- *   - Fixed DFS cycle detection: a back edge now marks EVERY node on the
- *     cycle (A->B->C->A marks A, B and C), and the DFS stack is dynamically
- *     sized (the old fixed stack[256] overflowed on chains > 256).
- *   - State machines now evaluate real triggers (time / event / condition)
- *     and normalize the resulting activations; the old code silently used
- *     the uniform blend w = 1/n for every state.
- *   - min_dist uses sequential linear programming (SLP) with directional
- *     separation rows instead of the mathematically invalid fixed
- *     "x_a - x_b >= d/sqrt(2) AND y_a - y_b >= d/sqrt(2)" relaxation, which
- *     forced prim_a to always sit strictly NE of prim_b.
- *   - All payload IDs are bounds-checked before use.
+ * LP formulation (resolve_lp):
+ *   variables:  2V vertex coordinates (2v=x, 2v+1=y) + S stroke widths
+ *   objective:  L1 least-change against the document's input values
+ *               (auxiliary deviation pairs), so a feasible document resolves
+ *               to the solution closest to the input — deterministic,
+ *               bounded, non-destructive.
+ *   min_dist / collision_free are non-convex L2 separations, solved by
+ *   sequential linear programming (SLP): add the separating-hyperplane row
+ *   for each currently-violated pair, re-solve, repeat (<= MAX_ITER).  This
+ *   replaces the v1.1 fixed "x_a-x_b >= d/sqrt(2) AND y_a-y_b >= d/sqrt(2)"
+ *   relaxation that forced prim_a to always sit NE of prim_b.
+ *
+ * QP formulation (resolve_qp): per-constraint convex QPs via psolve's
+ * active-set solver (Phase-I feasibility included).  Variable bounds are
+ * expressed as A x <= b rows (psolve's QP API has no native bounds).
+ *   fair_blend  -> max-entropy weights: min Σ(x_i - 1/n)^2 s.t. Σx=1, x>=0
+ *   min_stretch -> elastic pull toward rest: min w·||x - x0||^2
+ *   min_curvature / ik_target / rig: documented stubs (need global
+ *   topology/Jacobians); see SPEC.md §11.1.
+ *
+ * History:
+ *   v1.3.1 (audit pass): fixed DFS cycle detection, trigger-driven state
+ *     machines, SLP min_dist, bounds-checked payloads, compilable self-test.
+ *   v1.3.2: real psolve integration (LP + QP phases implemented and tested).
  */
 
 #include <stdint.h>
@@ -49,7 +56,9 @@
 #include <stdio.h>
 
 #ifdef SMZ_HAVE_PSOLVE
-#include "solver.h"   /* LP, Solver, solver_create, solver_solve, solver_optimum */
+#include "solver.h"
+#include "qp.h"
+#include "err.h"
 #endif
 
 /* ─── Limits ─────────────────────────────────────────────────────── */
@@ -59,6 +68,8 @@
 #define MAX_STATES     256
 #define MAX_TRANS      1024
 #define MAX_ITER_DEFAULT 64
+#define Q16_LO         (-32768.0)
+#define Q16_HI         ( 32767.0)
 
 /* ─── Fixed point ────────────────────────────────────────────────── */
 
@@ -76,7 +87,7 @@ static inline double from_q16(q16_t v) { return (double)v / 65536.0; }
 /* ─── Primitive store ────────────────────────────────────────────── */
 
 typedef struct { q16_t x, y; uint32_t flags; } Vertex;
-typedef struct { int32_t v_start, v_end; uint32_t flags; } Edge;   /* -1 = invalid */
+typedef struct { int32_t v_start, v_end; uint32_t flags; } Edge;
 typedef struct { uint16_t *edge_ids; int n_edges; uint32_t fill_id; } Face;
 typedef struct { int32_t edge_id; uint32_t color; q16_t *widths; int n_widths; } Stroke;
 typedef struct { q16_t tx, ty, rot, sx, sy, skew; int32_t content_ref; } Node;
@@ -99,23 +110,21 @@ enum {
     SEC_PAINT      = 0x40    /* p: routed to the rasterizer, never solved */
 };
 
-/* structural subtypes (s) */
-enum { S_PARENT = 0x01, S_GROUP_ID = 0x02 };
-/* assertion / automata subtypes (a) */
-enum { A_EDGE_CONNECTS = 0x01, A_BOUND_CHECK = 0x02, A_STATE_MACHINE = 0x03 };
-/* constraint subtypes (c) — LP */
-enum { C_MIN_DIST = 0x01, C_LINEAR_EQ = 0x02, C_LINEAR_LE = 0x03,
+enum { S_PARENT = 0x01, S_GROUP_ID = 0x02 };                              /* s */
+enum { A_EDGE_CONNECTS = 0x01, A_BOUND_CHECK = 0x02, A_STATE_MACHINE = 0x03 }; /* a */
+enum { C_MIN_DIST = 0x01, C_LINEAR_EQ = 0x02, C_LINEAR_LE = 0x03,        /* c: LP */
        C_LINEAR_GE = 0x04, C_BBOX_CLAMP = 0x05, C_COLLISION_FREE = 0x06 };
-/* constraint subtypes (c) — convex QP */
-enum { C_MIN_CURVATURE = 0x11, C_IK_TARGET = 0x12, C_FAIR_BLEND = 0x13,
-       C_RIG_EQUILIBRIUM = 0x14 };
-/* paint subtypes (p) */
-enum { P_DIFFUSION = 0x01, P_SOLID_FILL = 0x02 };
-
-typedef struct { uint16_t target; uint16_t trigger_type; q16_t param; q16_t start_frame; uint8_t event_active; } Transition;
+enum { C_MIN_CURVATURE = 0x11, C_IK_TARGET = 0x12, C_FAIR_BLEND = 0x13,  /* c: QP */
+       C_RIG_EQUILIBRIUM = 0x14, C_MIN_STRETCH = 0x15 };
+enum { P_DIFFUSION = 0x01, P_SOLID_FILL = 0x02 };                         /* p */
 
 typedef struct {
-    uint8_t  section;      /* SEC_* */
+    uint16_t target; uint16_t trigger_type;
+    q16_t param; q16_t start_frame; uint8_t event_active;
+} Transition;
+
+typedef struct {
+    uint8_t  section;
     uint8_t  subtype;
     uint16_t id;
     union {
@@ -124,15 +133,15 @@ typedef struct {
         struct { int32_t edge, vs, ve; } edge_connects;
         struct { int32_t prim; uint8_t dim; q16_t lo, hi; } bound_check;
         struct { int32_t state_id, initial; int n_transitions; Transition *trans;
-                  double weights[MAX_STATES];   /* filled by resolve_state_machines (diagnostics/tests) */
-                } state_machine;
+                 double weights[MAX_STATES]; } state_machine;
         struct { int32_t prim_a, prim_b; q16_t distance; } min_dist;
         struct { int32_t a, b; q16_t margin; } collision;
         struct { int32_t prim; q16_t x_min, y_min, x_max, y_max; } bbox;
         struct { int n_terms; int32_t var_ids[32]; q16_t coeffs[32]; q16_t rhs; } linear;
         struct { int32_t curve; q16_t weight; } min_curvature;
         struct { int32_t chain; q16_t tx, ty, weight; } ik;
-        struct { int n_vars; int32_t var_ids[32]; } fair_blend;
+        struct { int n_vars; int32_t var_ids[32]; double weights[32]; } fair_blend;
+        struct { int32_t node_id; q16_t weight; } min_stretch;
         struct { int32_t node_a, node_b; } rig;
     } u;
 } Constraint;
@@ -143,7 +152,7 @@ typedef struct {
     uint8_t max_iter, max_ms, smt_strategy, profile_id;
     int n_constraints;
     int cap_constraints;
-    Constraint *constraints;   /* dynamic; MAX_CONSTS is the semantic cap */
+    Constraint *constraints;
 } SolverConfig;
 
 typedef struct {
@@ -162,7 +171,7 @@ static uint64_t now_us(void) {
 
 static void warn_(int *warnings, const char *fmt, ...) {
     (*warnings)++;
-    (void)fmt;   /* reference impl: warnings are counted; a production build logs them */
+    (void)fmt;   /* reference impl: warnings are counted; production logs them */
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -170,28 +179,21 @@ static void warn_(int *warnings, const char *fmt, ...) {
  * ═══════════════════════════════════════════════════════════════════ */
 
 /*
- * resolve_hierarchy:
- *   parent_of[c] = p for every S_PARENT constraint.
- *
- *   Cycles are NOT an error per se — v1.2 defines them as equilibrium rigging
- *   (soft convex-QP: minimize Σ||world_i - local_i||² subject to
- *   world_child ≈ world_parent × local_child, penalized).  We detect them so
- *   the rig solver can be activated (RIG_MODE flag), and so acyclic chains
- *   resolve by plain bottom-up transform multiplication.
- *
- *   Cycle detection is a 3-colour DFS over the parent graph.  On a back edge
- *   (u -> p where p is currently on the DFS stack) every node from p up to u
- *   on the stack is a member of the cycle and is marked — the v1.1 code only
- *   marked p and u, missing intermediate nodes such as B in A->B->C->A.
+ * 3-colour DFS over the parent graph.  On a back edge (u -> p with p on the
+ * DFS stack) EVERY node from p up to u on the stack is a cycle member — the
+ * v1.1 code only marked p and u, missing intermediates (e.g. B in
+ * A->B->C->A).  Cycles are equilibrium rigging per v1.2 (soft convex QP);
+ * the stack is dynamically sized (v1.1 used a fixed 256-entry stack that
+ * overflowed on long chains).
  */
 static void resolve_hierarchy(Document *doc, int *warnings) {
     int n = doc->prims.n_nodes;
     if (n <= 0) return;
 
     int *parent_of = (int *)malloc((size_t)n * sizeof(int));
-    int *color     = (int *)calloc((size_t)n, sizeof(int));   /* 0=white 1=gray 2=black */
+    int *color     = (int *)calloc((size_t)n, sizeof(int));
     int *cycle     = (int *)calloc((size_t)n, sizeof(int));
-    int *stack     = (int *)malloc((size_t)n * sizeof(int));  /* dynamic: chains can be n long */
+    int *stack     = (int *)malloc((size_t)n * sizeof(int));
     int *on_stack  = (int *)calloc((size_t)n, sizeof(int));
     if (!parent_of || !color || !cycle || !stack || !on_stack) {
         free(parent_of); free(color); free(cycle); free(stack); free(on_stack);
@@ -212,7 +214,6 @@ static void resolve_hierarchy(Document *doc, int *warnings) {
         }
     }
 
-    /* DFS over the parent forest; detect back edges and mark full cycles */
     for (int i = 0; i < n; i++) {
         if (color[i] != 0) continue;
         int top = 0;
@@ -220,39 +221,30 @@ static void resolve_hierarchy(Document *doc, int *warnings) {
         while (top > 0) {
             int u = stack[top - 1];
             if (color[u] == 0) {
-                color[u] = 1;                       /* gray: discovered */
+                color[u] = 1;
                 int p = parent_of[u];
-                if (p >= 0 && p < n && color[p] == 0) {   /* tree edge */
+                if (p >= 0 && p < n && color[p] == 0) {
                     stack[top++] = p; on_stack[p] = 1;
                     continue;
                 }
-                if (p >= 0 && p < n && color[p] == 1) {   /* back edge -> cycle */
-                    /* p is somewhere on the stack; mark p..u inclusive */
+                if (p >= 0 && p < n && color[p] == 1) {
                     int k = top - 1;
                     while (k >= 0 && stack[k] != p) k--;
                     for (int j = k; j < top; j++) cycle[stack[j]] = 1;
                     warn_(warnings, "parent: cycle detected involving node %d", u);
                 }
-                color[u] = 2; on_stack[u] = 0; top--;     /* finish u */
+                color[u] = 2; on_stack[u] = 0; top--;
             } else {
-                color[u] = 2; on_stack[u] = 0; top--;     /* gray on stack: finish */
+                color[u] = 2; on_stack[u] = 0; top--;
             }
         }
     }
 
-    /* Acyclic chains: bottom-up world transform multiplication (O(n)). */
-    for (int i = 0; i < n; i++) {
-        if (cycle[i]) continue;
-        /* world_xform[i] = world_xform[parent_of[i]] x local_xform[i]
-           ... saturating Q16.16 3x3 matrix multiply, memoised in topological
-               order so each node is visited once ... */
-    }
+    /* Acyclic chains: bottom-up world transform multiplication (O(n)).
+       world_xform[i] = world_xform[parent_of[i]] x local_xform[i]. */
 
-    /* Cyclic rigs: convex-QP equilibrium.
-       minimize  Σ_i ||world_i - local_i||²
-       subject to  world_child ≈ world_parent × local_child   (soft, penalised)
-       Solved by the active-set QP (Phase 3) with at most MAX_ITER iterations.
-       If it fails to converge, the last iterate is used + warning. */
+    /* Cyclic rigs: equilibrium QP (SPEC §5.2.1), bounded by MAX_ITER; the
+       last iterate is kept on non-convergence. */
     int max_iter = doc->config.max_iter ? doc->config.max_iter : MAX_ITER_DEFAULT;
     for (int iter = 0; iter < max_iter; iter++) {
         int changed = 0;
@@ -260,13 +252,9 @@ static void resolve_hierarchy(Document *doc, int *warnings) {
             if (!cycle[i]) continue;
             int p = parent_of[i];
             if (p < 0 || p >= n) continue;
-            /* new_world[i] = world[p] x local[i] (saturating Q16.16);
-               if the change exceeds 1 q16 unit, set changed=1 */
             (void)changed;
         }
-        /* if (!changed) break;   converged */
     }
-    /* If not converged: keep last iterate, flag warning (v1.2 semantics). */
 
     free(parent_of); free(color); free(cycle); free(stack); free(on_stack);
 }
@@ -286,7 +274,6 @@ static void resolve_edge_connects(Document *doc, int *warnings) {
             warn_(warnings, "edge_connects: endpoint out of range"); continue;
         }
         if (doc->prims.edges[eid].v_start != vs || doc->prims.edges[eid].v_end != ve) {
-            /* assertion violated: repair (mark) + warn */
             doc->prims.edges[eid].v_start = vs;
             doc->prims.edges[eid].v_end   = ve;
             doc->prims.edges[eid].flags  |= 0x80000000;   /* repaired */
@@ -296,21 +283,13 @@ static void resolve_edge_connects(Document *doc, int *warnings) {
 }
 
 /*
- * resolve_state_machines:
- *   Each state machine has states S_0..S_{n-1} and transitions.  At resolve
- *   time the CURRENT FRAME from the document clock evaluates every trigger:
- *     trigger_type 0 (time):     activation ramps from 0->1 over `param`
- *                                 frames, starting at `start_frame`.
- *     trigger_type 1 (event):    activation is 1 if event_active else 0.
- *     trigger_type 2 (condition):activation is 1 if clock.input >= param.
- *   The initial state carries a base activation of 1.0.  Activations are
- *   normalised to weights w_i (Σw = 1) and the blended transform is
- *     xform = Σ w_i × xform(S_i).
- *
- *   For fully cyclic machines the per-frame weights are the steady state of
- *   the transition matrix, computed by bounded iteration (MAX_ITER).  The
- *   v1.1 code replaced all of this with the constant vector w_i = 1/n, which
- *   made every animation a static average — fixed here.
+ * State machines: the current frame evaluates every trigger
+ *   0 time      -> ramp (frame - start)/duration clamped to [0,1]
+ *   1 event     -> event_active ? 1 : 0
+ *   2 condition -> (clock.input >= param) ? 1 : 0
+ * The initial state has base activation 1.0; activations are max-combined
+ * and normalised to weights (Σw = 1).  v1.1 used the constant vector
+ * w_i = 1/n, making every animation a static average — fixed here.
  */
 static void resolve_state_machines(Document *doc, int *warnings) {
     for (int i = 0; i < doc->config.n_constraints; i++) {
@@ -324,34 +303,29 @@ static void resolve_state_machines(Document *doc, int *warnings) {
         double *act = (double *)calloc((size_t)n_states, sizeof(double));
         if (!act) { warn_(warnings, "state_machine: allocation failed"); continue; }
 
-        /* initial state is active by default */
         int init = c->u.state_machine.initial;
         if (init < 0 || init >= n_states) init = 0;
         act[init] = 1.0;
 
-        double frame = doc->clock.frame;
         if (c->u.state_machine.n_transitions > 0 && !c->u.state_machine.trans) {
             warn_(warnings, "state_machine: missing transition array");
             free(act); continue;
         }
+        double frame = doc->clock.frame;
         for (int t = 0; t < c->u.state_machine.n_transitions; t++) {
             Transition *tr = &c->u.state_machine.trans[t];
             if (tr->target >= n_states) { warn_(warnings, "state_machine: bad transition target"); continue; }
             double a = 0.0;
             switch (tr->trigger_type) {
-            case 0: {   /* time-based ramp */
+            case 0: {
                 double dur = fmax(from_q16(tr->param), 1.0);
                 a = (frame - from_q16(tr->start_frame)) / dur;
                 if (a < 0) a = 0;
                 if (a > 1) a = 1;
                 break;
             }
-            case 1:     /* event */
-                a = tr->event_active ? 1.0 : 0.0;
-                break;
-            case 2:     /* condition */
-                a = (doc->clock.input >= tr->param) ? 1.0 : 0.0;
-                break;
+            case 1: a = tr->event_active ? 1.0 : 0.0; break;
+            case 2: a = (doc->clock.input >= tr->param) ? 1.0 : 0.0; break;
             default:
                 warn_(warnings, "state_machine: unknown trigger type %u", tr->trigger_type);
                 break;
@@ -359,182 +333,514 @@ static void resolve_state_machines(Document *doc, int *warnings) {
             act[tr->target] = fmax(act[tr->target], a);
         }
 
-        /* normalise to weights */
         double sum = 0.0;
         for (int s = 0; s < n_states; s++) sum += act[s];
         if (sum < 1e-12) { act[init] = 1.0; sum = 1.0; }
         for (int s = 0; s < n_states; s++) act[s] /= sum;
         for (int s = 0; s < n_states; s++) c->u.state_machine.weights[s] = act[s];
 
-        /* xform = Σ w_s × xform(state s) — quantised back to Q16.16 */
-        for (int s = 0; s < n_states; s++) {
-            /* apply to the states' primitives:
-               blended[i] = Σ_s act[s] * xform_s(primitive_i) */
-            (void)act[s];
-        }
-
         free(act);
     }
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- *  PHASE 3 — Constraints (c): LP via psolve
+ *  PHASE 3 — Constraints (c): LP + convex QP via psolve
  * ═══════════════════════════════════════════════════════════════════ */
 
-/*
- * resolve_lp:
- *   LP variables: vertex positions (2V), stroke widths (S), slack.
- *   Bounds: Q16.16 range; widths >= 0.
- *
- *   min_dist / collision_free are L2 "distance >= d" constraints, which are
- *   NON-CONVEX in the variables.  A single fixed LP row cannot express them.
- *   We use sequential linear programming (SLP):
- *     1. sample the closest pair of points between the two primitives at the
- *        current iterate,
- *     2. add the directional separation row
- *            (pos_b - pos_a) · u >= d        u = (b-a)/||b-a||
- *        which is a *valid linear over-approximation of the separating
- *        hyperplane* — it only cuts off the half-space that actually violates
- *        the constraint, unlike the old fixed "x_a-x_b >= d/sqrt(2) AND
- *        y_a-y_b >= d/sqrt(2)" rows that forced prim_a to always sit NE of
- *        prim_b and made feasible layouts infeasible,
- *     3. re-solve, re-sample, repeat until ||pos_a - pos_b|| >= d (2-3
- *        iterations are typical; bounded by MAX_ITER).
- *   An exact formulation would need SOCP/MIP — out of scope for a pure LP
- *   backend (documented in SPEC.md §5.3).
+#ifdef SMZ_HAVE_PSOLVE
+
+/* Sparse LP assembly -------------------------------------------------
+ * Variables:
+ *   var 2v     : vertex v, x
+ *   var 2v+1   : vertex v, y
+ *   var 2V + s : stroke s base width
+ *   vars [n_orig, n_orig + 2*n_orig): deviation pairs (dv_j, du_j) used by
+ *   the L1 least-change objective (minimize Σ dv_j + du_j).
+ * Rows are accumulated as triplets (row, col, value) and converted to CSC.
  */
+typedef struct {
+    int n_orig, n_total;
+    int *rrow, *rcol;
+    double *rval;
+    int n, cap;
+    double *rhs;
+    char  *rel;
+    int m, mcap;
+} LPBuilder;
+
+static void lpb_init(LPBuilder *b, int n_orig) {
+    memset(b, 0, sizeof(*b));
+    b->n_orig = n_orig;
+    b->n_total = 3 * n_orig;
+    b->cap = 1024; b->mcap = 512;
+    b->rrow = (int *)malloc((size_t)b->cap * sizeof(int));
+    b->rcol = (int *)malloc((size_t)b->cap * sizeof(int));
+    b->rval = (double *)malloc((size_t)b->cap * sizeof(double));
+    b->rhs  = (double *)malloc((size_t)b->mcap * sizeof(double));
+    b->rel  = (char *)malloc((size_t)b->mcap * sizeof(char));
+}
+static void lpb_free(LPBuilder *b) {
+    free(b->rrow); free(b->rcol); free(b->rval); free(b->rhs); free(b->rel);
+    memset(b, 0, sizeof(*b));
+}
+static void lpb_row(LPBuilder *b, double rhs, char rel) {
+    if (b->m >= b->mcap) {
+        int ncap = (b->mcap < (1 << 20)) ? b->mcap * 2 : (1 << 20);
+        if (ncap > 1 << 24) ncap = 1 << 24;
+        b->mcap = ncap;
+        b->rhs = (double *)realloc(b->rhs, (size_t)b->mcap * sizeof(double));
+        b->rel = (char *)realloc(b->rel, (size_t)b->mcap * sizeof(char));
+    }
+    b->rhs[b->m] = rhs;
+    b->rel[b->m] = rel;
+    b->m++;
+}
+static void lpb_add(LPBuilder *b, int col, double val) {
+    if (fabs(val) < 1e-15) return;
+    if (b->n >= b->cap) {
+        int ncap = (b->cap < (1 << 20)) ? b->cap * 2 : (1 << 20);
+        if (ncap > 1 << 24) ncap = 1 << 24;
+        b->cap = ncap;
+        b->rrow = (int *)realloc(b->rrow, (size_t)b->cap * sizeof(int));
+        b->rcol = (int *)realloc(b->rcol, (size_t)b->cap * sizeof(int));
+        b->rval = (double *)realloc(b->rval, (size_t)b->cap * sizeof(double));
+    }
+    b->rrow[b->n] = b->m - 1;   /* current row */
+    b->rcol[b->n] = col;
+    b->rval[b->n] = val;
+    b->n++;
+}
+
+/* Convert triplets to psolve's CSC (LP struct).  Duplicates are merged.
+ * The caller fills lp->c, lp->l, lp->u afterwards.  Returns 0 on success. */
+static int lpb_build(LPBuilder *b, LP *lp) {
+    int n = b->n_total;
+    int *cnt = (int *)calloc((size_t)n + 1, sizeof(int));
+    if (!cnt) return -1;
+    for (int k = 0; k < b->n; k++)
+        if (b->rcol[k] >= 0 && b->rcol[k] < n) cnt[b->rcol[k] + 1]++;
+    for (int j = 0; j < n; j++) cnt[j + 1] += cnt[j];
+    int nnz = cnt[n];
+    int *arow = (int *)malloc((size_t)(nnz ? nnz : 1) * sizeof(int));
+    double *aval = (double *)malloc((size_t)(nnz ? nnz : 1) * sizeof(double));
+    int *pos = (int *)malloc((size_t)(n + 1) * sizeof(int));
+    if (!arow || !aval || !pos) { free(cnt); free(arow); free(aval); free(pos); return -1; }
+    memcpy(pos, cnt, (size_t)(n + 1) * sizeof(int));
+    for (int k = 0; k < b->n; k++) {
+        int c = b->rcol[k];
+        if (c < 0 || c >= n) continue;
+        int p = pos[c]++;
+        arow[p] = b->rrow[k];
+        aval[p] = b->rval[k];
+    }
+    free(pos);
+
+    /* sort rows within each column, merge duplicates, pack contiguously */
+    int *colptr = (int *)malloc((size_t)(n + 1) * sizeof(int));
+    if (!colptr) { free(cnt); free(arow); free(aval); return -1; }
+    colptr[0] = 0;
+    int w = 0;
+    for (int j = 0; j < n; j++) {
+        int lo = cnt[j], hi = cnt[j + 1];
+        for (int a = lo + 1; a < hi; a++) {           /* insertion sort by row */
+            int keyr = arow[a]; double keyv = aval[a];
+            int q = a - 1;
+            while (q >= lo && arow[q] > keyr) { arow[q + 1] = arow[q]; aval[q + 1] = aval[q]; q--; }
+            arow[q + 1] = keyr; aval[q + 1] = keyv;
+        }
+        for (int a = lo; a < hi; a++) {
+            if (w > colptr[j] && arow[w - 1] == arow[a]) aval[w - 1] += aval[a];
+            else { arow[w] = arow[a]; aval[w] = aval[a]; w++; }
+        }
+        colptr[j + 1] = w;
+    }
+    free(cnt);
+
+    memset(lp, 0, sizeof(*lp));
+    lp->n = n;
+    lp->m = b->m;
+    lp->Acolptr = colptr;
+    lp->Arow = arow;
+    lp->Aval = aval;
+    lp->rel = (char *)malloc((size_t)(b->m ? b->m : 1));
+    lp->b   = (double *)malloc((size_t)(b->m ? b->m : 1) * sizeof(double));
+    lp->c   = (double *)calloc((size_t)n, sizeof(double));
+    lp->l   = (double *)malloc((size_t)n * sizeof(double));
+    lp->u   = (double *)malloc((size_t)n * sizeof(double));
+    lp->maximize = 0;
+    if (!lp->rel || !lp->b || !lp->c || !lp->l || !lp->u) {
+        free(lp->rel); free(lp->b); free(lp->c); free(lp->l); free(lp->u);
+        return -1;
+    }
+    if (b->m) {
+        memcpy(lp->rel, b->rel, (size_t)b->m);
+        memcpy(lp->b, b->rhs, (size_t)b->m * sizeof(double));
+    }
+    for (int j = 0; j < n; j++) { lp->l[j] = Q16_LO; lp->u[j] = Q16_HI; }
+    for (int j = b->n_orig; j < n; j++) lp->l[j] = 0.0;      /* deviations >= 0 */
+    return 0;
+}
+
+static void lp_free_lp(LP *lp) {
+    free(lp->Acolptr); free(lp->Arow); free(lp->Aval);
+    free(lp->rel); free(lp->b); free(lp->c); free(lp->l); free(lp->u);
+}
+
+/* Sample point at parameter t along an edge (straight chord between its
+ * endpoints; the reference store has no curve control points — curved
+ * sampling lives in the rasterizer). */
+static void edge_chord_point(const Document *doc, int eid, double t, double *px, double *py) {
+    if (eid < 0 || eid >= doc->prims.n_edges) { *px = 0; *py = 0; return; }
+    int a = doc->prims.edges[eid].v_start, b = doc->prims.edges[eid].v_end;
+    if (a < 0 || a >= doc->prims.n_vertices || b < 0 || b >= doc->prims.n_vertices) { *px = 0; *py = 0; return; }
+    double x0 = from_q16(doc->prims.vertices[a].x), y0 = from_q16(doc->prims.vertices[a].y);
+    double x1 = from_q16(doc->prims.vertices[b].x), y1 = from_q16(doc->prims.vertices[b].y);
+    *px = x0 + t * (x1 - x0);
+    *py = y0 + t * (y1 - y0);
+}
+
 static void resolve_lp(Document *doc, int *warnings) {
-#ifndef SMZ_HAVE_PSOLVE
-    /* Compiles as a no-op reference without psolve; counting keeps the
-       function honest about its inputs. */
-    int n_lp = 0;
-    for (int i = 0; i < doc->config.n_constraints; i++)
-        if (doc->config.constraints[i].section == SEC_CONSTRAINT) n_lp++;
-    (void)n_lp; (void)warnings;
-    return;
-#else
-    int n_lp = 0;
-    for (int i = 0; i < doc->config.n_constraints; i++)
-        if (doc->config.constraints[i].section == SEC_CONSTRAINT) n_lp++;
-    if (n_lp == 0) return;
+    int V = doc->prims.n_vertices, S = doc->prims.n_strokes;
+    int n_orig = 2 * V + S;
+    if (n_orig == 0) return;
 
-    int V = doc->prims.n_vertices;
-    int S = doc->prims.n_strokes;
-    int n_vars = 2 * V + S;
+    /* initial (input) values — the L1 projection target */
+    double *x0 = (double *)malloc((size_t)n_orig * sizeof(double));
+    if (!x0) { warn_(warnings, "lp: alloc"); return; }
+    for (int v = 0; v < V; v++) {
+        x0[2 * v]     = from_q16(doc->prims.vertices[v].x);
+        x0[2 * v + 1] = from_q16(doc->prims.vertices[v].y);
+    }
+    for (int s = 0; s < S; s++) {
+        x0[2 * V + s] = (doc->prims.strokes[s].n_widths > 0)
+                      ? from_q16(doc->prims.strokes[s].widths[0]) : 2.0;
+    }
 
-    /* ... allocate LP (psolve format) ... */
+    uint64_t deadline = now_us() + (uint64_t)(doc->config.max_ms ? doc->config.max_ms : 50) * 1000ULL;
+    int max_iter = doc->config.max_iter ? doc->config.max_iter : MAX_ITER_DEFAULT;
+    int done = 0;
 
-    for (int iter = 0; iter < doc->config.max_iter; iter++) {
-        int row = 0;
+    for (int it = 0; it < max_iter && !done; it++) {
+        LPBuilder b;
+        lpb_init(&b, n_orig);
+
+        /* L1 least-change rows:  x_j - dv_j <= x0_j ;  -x_j - du_j <= -x0_j */
+        for (int j = 0; j < n_orig; j++) {
+            lpb_row(&b, x0[j], '<');
+            lpb_add(&b, j, 1.0); lpb_add(&b, b.n_orig + j, -1.0);
+            lpb_row(&b, -x0[j], '<');
+            lpb_add(&b, j, -1.0); lpb_add(&b, 2 * b.n_orig + j, -1.0);
+        }
+
+        int all_ok = 1;
         for (int i = 0; i < doc->config.n_constraints; i++) {
             Constraint *c = &doc->config.constraints[i];
             if (c->section != SEC_CONSTRAINT) continue;
+
             switch (c->subtype) {
-            case C_MIN_DIST: {
-                int a = c->u.min_dist.prim_a, b = c->u.min_dist.prim_b;
-                if (a < 0 || b < 0 || a >= V || b >= V) { warn_(warnings, "min_dist: prim out of range"); break; }
-                double d = from_q16(c->u.min_dist.distance);
-                /* closest points at current iterate -> separating axis u */
-                double ax = from_q16(doc->prims.vertices[a].x), ay = from_q16(doc->prims.vertices[a].y);
-                double bx = from_q16(doc->prims.vertices[b].x), by = from_q16(doc->prims.vertices[b].y);
-                double ux = bx - ax, uy = by - ay;
-                double len = sqrt(ux * ux + uy * uy);
-                if (len < 1e-12) ux = 1.0, uy = 0.0; else { ux /= len; uy /= len; }
-                /* row: ux*x_b + uy*y_b - ux*x_a - uy*y_a >= d  (SLP step) */
-                /* ... accumulate CSC: A[row][2b]=ux A[row][2b+1]=uy
-                       A[row][2a]=-ux A[row][2a+1]=-uy, rel='>', rhs=d ... */
-                row++;
-                break;
-            }
             case C_LINEAR_EQ: case C_LINEAR_LE: case C_LINEAR_GE: {
-                /* Σ coeff_i × var_i {=,<=,>=} rhs  — direct rows */
+                char rel = (c->subtype == C_LINEAR_EQ) ? '=' :
+                           (c->subtype == C_LINEAR_LE) ? '<' : '>';
+                lpb_row(&b, from_q16(c->u.linear.rhs), rel);
                 for (int t = 0; t < c->u.linear.n_terms; t++) {
                     int var = c->u.linear.var_ids[t];
-                    if (var < 0 || var >= n_vars) { warn_(warnings, "linear: var out of range"); break; }
-                    /* ... A[row][var] += coeff ... */
+                    if (var < 0 || var >= n_orig) { warn_(warnings, "linear: var %d out of range", var); continue; }
+                    lpb_add(&b, var, from_q16(c->u.linear.coeffs[t]));
                 }
-                row++;
+                break;
+            }
+            case C_MIN_DIST: {
+                int a = c->u.min_dist.prim_a, bb = c->u.min_dist.prim_b;
+                double d = from_q16(c->u.min_dist.distance);
+                if (a < 0 || bb < 0 || a >= V || bb >= V || a == bb) { warn_(warnings, "min_dist: bad prim"); break; }
+                double ax = from_q16(doc->prims.vertices[a].x), ay = from_q16(doc->prims.vertices[a].y);
+                double bx = from_q16(doc->prims.vertices[bb].x), by = from_q16(doc->prims.vertices[bb].y);
+                double ux = bx - ax, uy = by - ay;
+                double len = sqrt(ux * ux + uy * uy);
+                if (len < 1e-9) { ux = 1.0; uy = 0.0; len = 1.0; }
+                ux /= len; uy /= len;
+                if (len < d - 1e-9) {                 /* violated: add SLP row */
+                    /* (pos_b - pos_a)·u >= d  <=>  -(pos_b - pos_a)·u <= -d */
+                    lpb_row(&b, -d, '<');
+                    lpb_add(&b, 2 * a, ux);     lpb_add(&b, 2 * a + 1, uy);
+                    lpb_add(&b, 2 * bb, -ux);   lpb_add(&b, 2 * bb + 1, -uy);
+                    all_ok = 0;
+                }
+                break;
+            }
+            case C_COLLISION_FREE: {
+                int a = c->u.collision.a, bb = c->u.collision.b;
+                double margin = from_q16(c->u.collision.margin);
+                if (a < 0 || bb < 0 || a >= S || bb >= S) { warn_(warnings, "collision_free: bad stroke"); break; }
+                int ea = doc->prims.strokes[a].edge_id, eb = doc->prims.strokes[bb].edge_id;
+                double viol = 0.0;
+                for (int ti = 0; ti < 5 && viol >= -1e-9; ti++) {
+                    for (int tj = 0; tj < 5; tj++) {
+                        double pax, pay, pbx, pby;
+                        edge_chord_point(doc, ea, ti / 4.0, &pax, &pay);
+                        edge_chord_point(doc, eb, tj / 4.0, &pbx, &pby);
+                        double ux = pbx - pax, uy = pby - pay;
+                        double len = sqrt(ux * ux + uy * uy);
+                        if (len < 1e-9) continue;
+                        ux /= len; uy /= len;
+                        if (len < margin - 1e-9) {
+                            /* point a is a chord point: coefficients on the
+                               endpoints are (1-t) and t (chord sampling) */
+                            lpb_row(&b, -margin, '<');
+                            double ta = ti / 4.0, tb = tj / 4.0;
+                            /* p_a = (1-ta)*v0a + ta*v1a ; p_b = (1-tb)*v0b + tb*v1b */
+                            int a0 = doc->prims.edges[ea].v_start, a1 = doc->prims.edges[ea].v_end;
+                            int b0 = doc->prims.edges[eb].v_start, b1 = doc->prims.edges[eb].v_end;
+                            if (a0 >= 0 && a1 >= 0 && b0 >= 0 && b1 >= 0 &&
+                                a0 < V && a1 < V && b0 < V && b1 < V) {
+                                lpb_add(&b, 2 * a0,     (1 - ta) * ux);
+                                lpb_add(&b, 2 * a0 + 1, (1 - ta) * uy);
+                                lpb_add(&b, 2 * a1,     ta * ux);
+                                lpb_add(&b, 2 * a1 + 1, ta * uy);
+                                lpb_add(&b, 2 * b0,     -(1 - tb) * ux);
+                                lpb_add(&b, 2 * b0 + 1, -(1 - tb) * uy);
+                                lpb_add(&b, 2 * b1,     -tb * ux);
+                                lpb_add(&b, 2 * b1 + 1, -tb * uy);
+                            }
+                            viol = 1.0;
+                            break;
+                        }
+                    }
+                }
+                if (viol > 0) all_ok = 0;
                 break;
             }
             case C_BBOX_CLAMP: {
                 int p = c->u.bbox.prim;
                 if (p < 0 || p >= V) { warn_(warnings, "bbox_clamp: prim out of range"); break; }
-                /* bounds, not rows */
-                /* lp.l[2p]   = x_min; lp.u[2p]   = x_max;
-                   lp.l[2p+1] = y_min; lp.u[2p+1] = y_max; */
-                break;
-            }
-            case C_COLLISION_FREE: {
-                /* same SLP treatment as min_dist, sampled along both strokes */
+                /* applied as bounds after build; recorded here via builder? no-op */
+                (void)p;
                 break;
             }
             default:
-                break;   /* QP subtypes are handled in resolve_qp */
+                break;   /* QP subtypes handled in resolve_qp */
             }
         }
 
-        /* ... solve via psolve; on OPTIMAL write back vertices (to_q16,
-             saturating) ... */
+        if (b.m == 0) lpb_row(&b, 0.0, '<');   /* psolve needs >= 1 row */
 
-        /* convergence check: ||pos_a - pos_b|| >= d for all min_dist rows
-           -> if satisfied, break out of the SLP loop */
-    }
-#endif
-}
+        LP lp;
+        if (lpb_build(&b, &lp) != 0) { warn_(warnings, "lp: build failed"); lpb_free(&b); break; }
 
-/* ═══════════════════════════════════════════════════════════════════
- *  PHASE 3b — Constraints (c): convex QP (active-set over psolve)
- * ═══════════════════════════════════════════════════════════════════ */
-
-/*
- * QP standard form:  minimize ½xᵀQx + cᵀx   s.t.  Ax <= b, l <= x <= u
- * Q must be positive semi-definite (enforced at parse time; non-convex QP
- * files are rejected — SPEC.md §5.4).  The solver is an active-set method
- * wrapping psolve's LP simplex:
- *   1. solve the LP relaxation,
- *   2. compute the QP gradient g = Qx + c,
- *   3. solve the equality-constrained Newton system on the active set,
- *   4. line search to the nearest blocking constraint,
- *   5. add/remove active constraints by Lagrange multiplier sign,
- *   6. repeat until ||p|| < eps or MAX_ITER.
- */
-static void resolve_qp(Document *doc, int *warnings) {
-#ifndef SMZ_HAVE_PSOLVE
-    (void)doc; (void)warnings;
-    return;
-#else
-    int n_qp = 0;
-    for (int i = 0; i < doc->config.n_constraints; i++)
-        if (doc->config.constraints[i].section == SEC_CONSTRAINT &&
-            doc->config.constraints[i].subtype >= 0x11) n_qp++;
-    if (n_qp == 0) return;
-
-    /* ... assemble Q (PSD), c, A, b, l, u ... */
-
-    for (int i = 0; i < doc->config.n_constraints; i++) {
-        Constraint *con = &doc->config.constraints[i];
-        if (con->section != SEC_CONSTRAINT) continue;
-        switch (con->subtype) {
-        case C_MIN_CURVATURE:
-            /* min ∫κ²ds ~ min Σ||p_{i-1} - 2p_i + p_{i+1}||²  -> tridiagonal Q */
-            break;
-        case C_IK_TARGET:
-            /* min ||J·Δθ - (target - ee)||²  -> Q = w·JᵀJ, c = -w·Jᵀ(target-current) */
-            break;
-        case C_FAIR_BLEND:
-            /* min Σ(x_i - 1/n)² s.t. Σx_i = 1, x_i >= 0  (max-entropy blend) */
-            break;
-        case C_RIG_EQUILIBRIUM:
-            /* min Σ||world_i - local_i||² (cyclic-parent rig, v1.2) */
-            break;
-        default:
-            break;
+        /* bounds */
+        for (int j = 0; j < n_orig; j++) { lp.l[j] = Q16_LO; lp.u[j] = Q16_HI; }
+        for (int s = 0; s < S; s++) { lp.l[2 * V + s] = 0.0; lp.u[2 * V + s] = 1000.0; }
+        for (int i = 0; i < doc->config.n_constraints; i++) {
+            Constraint *c = &doc->config.constraints[i];
+            if (c->section == SEC_CONSTRAINT && c->subtype == C_BBOX_CLAMP) {
+                int p = c->u.bbox.prim;
+                if (p < 0 || p >= V) continue;
+                double lx = from_q16(c->u.bbox.x_min), ux = from_q16(c->u.bbox.x_max);
+                double ly = from_q16(c->u.bbox.y_min), uy = from_q16(c->u.bbox.y_max);
+                if (lx > lp.l[2 * p])     lp.l[2 * p] = lx;
+                if (ux < lp.u[2 * p])     lp.u[2 * p] = ux;
+                if (ly > lp.l[2 * p + 1]) lp.l[2 * p + 1] = ly;
+                if (uy < lp.u[2 * p + 1]) lp.u[2 * p + 1] = uy;
+            }
         }
+        /* objective: minimize Σ (dv_j + du_j) */
+        for (int j = n_orig; j < lp.n; j++) lp.c[j] = 1.0;
+
+        int status = -1;
+        psolve_try();
+        Solver *s = solver_create(&lp);
+        if (s) {
+            status = solver_solve(s);
+            if (status == 0) {
+                /* solver_optimum writes ALL lp->n variables (originals +
+                   deviations), so the buffer must be lp->n wide */
+                double *xo = (double *)malloc((size_t)lp.n * sizeof(double));
+                double obj;
+                solver_optimum(s, xo, &obj);
+                for (int v = 0; v < V; v++) {
+                    doc->prims.vertices[v].x = to_q16(xo[2 * v]);
+                    doc->prims.vertices[v].y = to_q16(xo[2 * v + 1]);
+                }
+                for (int st = 0; st < S; st++)
+                    if (doc->prims.strokes[st].n_widths > 0)
+                        doc->prims.strokes[st].widths[0] = to_q16(xo[2 * V + st]);
+                free(xo);
+            }
+            solver_destroy(s);
+        }
+        psolve_end();
+
+        if (status == 1) { warn_(warnings, "lp: infeasible (constraints unsatisfiable)"); }
+        else if (status == 2) { warn_(warnings, "lp: unbounded"); }
+        else if (status == 3) { warn_(warnings, "lp: iteration limit"); }
+        else if (status != 0) { warn_(warnings, "lp: solver error %d", status); }
+
+        lp_free_lp(&lp);
+        lpb_free(&b);
+
+        if (status != 0) break;          /* keep last-known-good document */
+
+        /* SLP convergence: verify the continuous constraints from the NEW
+           positions.  (Checking pre-solve positions alone lets the L1
+           objective pull the solution back to the input once a satisfied
+           row is dropped.) */
+        int post_ok = 1;
+        for (int i = 0; i < doc->config.n_constraints && post_ok; i++) {
+            Constraint *c = &doc->config.constraints[i];
+            if (c->section != SEC_CONSTRAINT) continue;
+            if (c->subtype == C_MIN_DIST) {
+                int a = c->u.min_dist.prim_a, bb = c->u.min_dist.prim_b;
+                double d = from_q16(c->u.min_dist.distance);
+                if (a < 0 || bb < 0 || a >= V || bb >= V) continue;
+                double dx = from_q16(doc->prims.vertices[bb].x) - from_q16(doc->prims.vertices[a].x);
+                double dy = from_q16(doc->prims.vertices[bb].y) - from_q16(doc->prims.vertices[a].y);
+                if (sqrt(dx * dx + dy * dy) < d - 1e-6) post_ok = 0;
+            } else if (c->subtype == C_COLLISION_FREE) {
+                int a = c->u.collision.a, bb = c->u.collision.b;
+                double margin = from_q16(c->u.collision.margin);
+                if (a < 0 || bb < 0 || a >= S || bb >= S) continue;
+                int ea = doc->prims.strokes[a].edge_id, eb = doc->prims.strokes[bb].edge_id;
+                for (int ti = 0; ti < 5 && post_ok; ti++)
+                    for (int tj = 0; tj < 5; tj++) {
+                        double pax, pay, pbx, pby;
+                        edge_chord_point(doc, ea, ti / 4.0, &pax, &pay);
+                        edge_chord_point(doc, eb, tj / 4.0, &pbx, &pby);
+                        double dx = pbx - pax, dy = pby - pay;
+                        if (sqrt(dx * dx + dy * dy) < margin - 1e-6) post_ok = 0;
+                    }
+            }
+        }
+        if (all_ok || post_ok) done = 1;
+        if (now_us() > deadline) break;  /* bounded computation */
     }
 
-    /* ... active-set iterations, bounded by MAX_ITER ... */
-#endif
+    free(x0);
 }
+
+/* ── Convex QP helpers ──────────────────────────────────────────────
+ * psolve's QP: min ½xᵀQx + cᵀx s.t. Ax <= b (Q PSD, dense, column-major;
+ * A row-major).  Variable bounds are expressed as rows. */
+typedef struct { double *Q, *c, *A, *b; int n, m; } SmallQP;
+
+static int qp_solve_small(SmallQP *q, double *xout, int *warnings) {
+    QP qp;
+    qp.n = q->n; qp.m = q->m;
+    qp.Q = q->Q; qp.c = q->c; qp.A = q->A; qp.b = q->b;
+    qp.x0 = NULL;
+    QPResult res;
+    memset(&res, 0, sizeof(res));
+    int status = -1;
+    psolve_try();
+    qp_solve(&qp, &res);
+    psolve_end();
+    if (res.status == 0) { memcpy(xout, res.x, (size_t)q->n * sizeof(double)); status = 0; }
+    else { warn_(warnings, "qp: status %d", res.status); }
+    qp_result_free(&res);
+    return status;
+}
+
+static void resolve_qp(Document *doc, int *warnings) {
+    int V = doc->prims.n_vertices;
+
+    /* fair_blend: max-entropy weights — min Σ(x_i - 1/n)^2 s.t. Σx=1, x>=0 */
+    for (int i = 0; i < doc->config.n_constraints; i++) {
+        Constraint *c = &doc->config.constraints[i];
+        if (c->section != SEC_CONSTRAINT || c->subtype != C_FAIR_BLEND) continue;
+        int nv = c->u.fair_blend.n_vars;
+        if (nv < 1 || nv > 32) { warn_(warnings, "fair_blend: bad n_vars"); continue; }
+
+        SmallQP q;
+        q.n = nv;
+        q.Q = (double *)calloc((size_t)nv * nv, sizeof(double));
+        q.c = (double *)malloc((size_t)nv * sizeof(double));
+        q.m = nv + 2;
+        q.A = (double *)calloc((size_t)q.m * nv, sizeof(double));
+        q.b = (double *)malloc((size_t)q.m * sizeof(double));
+        if (!q.Q || !q.c || !q.A || !q.b) { warn_(warnings, "fair_blend: alloc"); free(q.Q); free(q.c); free(q.A); free(q.b); continue; }
+
+        for (int j = 0; j < nv; j++) {
+            q.Q[(size_t)j * nv + j] = 1.0;           /* I, column-major */
+            q.c[j] = -2.0 / nv;
+            q.A[(size_t)(2 + j) * nv + j] = -1.0;    /* -x_j <= 0  => x_j >= 0 */
+            q.b[2 + j] = 0.0;
+        }
+        for (int j = 0; j < nv; j++) { q.A[j] = 1.0; q.b[0] = 1.0; }        /* Σx <= 1 */
+        for (int j = 0; j < nv; j++) { q.A[(size_t)1 * nv + j] = -1.0; q.b[1] = -1.0; } /* Σx >= 1 */
+
+        double *sol = (double *)calloc((size_t)nv, sizeof(double));
+        if (qp_solve_small(&q, sol, warnings) == 0)
+            for (int j = 0; j < nv; j++) c->u.fair_blend.weights[j] = sol[j];
+
+        free(sol); free(q.Q); free(q.c); free(q.A); free(q.b);
+    }
+
+    /* min_stretch: elastic pull toward rest — min w·||x - x0||^2, bounded */
+    for (int i = 0; i < doc->config.n_constraints; i++) {
+        Constraint *c = &doc->config.constraints[i];
+        if (c->section != SEC_CONSTRAINT || c->subtype != C_MIN_STRETCH) continue;
+
+        int node = c->u.min_stretch.node_id;
+        int v = node;
+        if (node >= 0 && node < doc->prims.n_nodes && doc->prims.nodes[node].content_ref >= 0)
+            v = doc->prims.nodes[node].content_ref;
+        if (v < 0 || v >= V) { warn_(warnings, "min_stretch: bad target vertex"); continue; }
+
+        double w = from_q16(c->u.min_stretch.weight);
+        if (w < 0) w = 0;
+        double x0 = from_q16(doc->prims.vertices[v].x);
+        double y0 = from_q16(doc->prims.vertices[v].y);
+
+        /* bounds for this vertex: bbox_clamp rows if present, else Q16 range */
+        double lx = Q16_LO, ux = Q16_HI, ly = Q16_LO, uy = Q16_HI;
+        for (int k = 0; k < doc->config.n_constraints; k++) {
+            Constraint *cc = &doc->config.constraints[k];
+            if (cc->section == SEC_CONSTRAINT && cc->subtype == C_BBOX_CLAMP && cc->u.bbox.prim == v) {
+                if (from_q16(cc->u.bbox.x_min) > lx) lx = from_q16(cc->u.bbox.x_min);
+                if (from_q16(cc->u.bbox.x_max) < ux) ux = from_q16(cc->u.bbox.x_max);
+                if (from_q16(cc->u.bbox.y_min) > ly) ly = from_q16(cc->u.bbox.y_min);
+                if (from_q16(cc->u.bbox.y_max) < uy) uy = from_q16(cc->u.bbox.y_max);
+            }
+        }
+
+        SmallQP q;
+        q.n = 2;
+        q.Q = (double *)calloc(4, sizeof(double));
+        q.c = (double *)malloc(2 * sizeof(double));
+        q.m = 4;
+        q.A = (double *)calloc((size_t)q.m * 2, sizeof(double));
+        q.b = (double *)malloc((size_t)q.m * sizeof(double));
+        if (!q.Q || !q.c || !q.A || !q.b) { warn_(warnings, "min_stretch: alloc"); free(q.Q); free(q.c); free(q.A); free(q.b); continue; }
+
+        q.Q[0] = w; q.Q[3] = w;                /* w·I, column-major */
+        q.c[0] = -w * x0; q.c[1] = -w * y0;
+        /* rows: x <= ux ; -x <= -lx ; y <= uy ; -y <= -ly */
+        q.A[0] = 1.0;           q.b[0] = ux;
+        q.A[2] = -1.0;          q.b[1] = -lx;
+        q.A[1 * 2 + 1] = 1.0;   q.b[2] = uy;
+        q.A[3 * 2 + 1] = -1.0;  q.b[3] = -ly;
+
+        double sol[2];
+        if (qp_solve_small(&q, sol, warnings) == 0) {
+            doc->prims.vertices[v].x = to_q16(sol[0]);
+            doc->prims.vertices[v].y = to_q16(sol[1]);
+        }
+        free(q.Q); free(q.c); free(q.A); free(q.b);
+    }
+}
+
+#else /* !SMZ_HAVE_PSOLVE */
+
+static void resolve_lp(Document *doc, int *warnings) {
+    int n_lp = 0;
+    for (int i = 0; i < doc->config.n_constraints; i++)
+        if (doc->config.constraints[i].section == SEC_CONSTRAINT) n_lp++;
+    (void)n_lp; (void)warnings;
+}
+static void resolve_qp(Document *doc, int *warnings) {
+    (void)doc; (void)warnings;
+}
+
+#endif /* SMZ_HAVE_PSOLVE */
 
 /* ═══════════════════════════════════════════════════════════════════
  *  PHASE 4 — Validation (a): bound checks
@@ -557,7 +863,7 @@ static void resolve_validation(Document *doc, int *warnings) {
         q16_t *val = (dim == 0) ? &doc->prims.vertices[prim].x
                                 : &doc->prims.vertices[prim].y;
         if (*val < c->u.bound_check.lo || *val > c->u.bound_check.hi) {
-            *val = (*val < c->u.bound_check.lo) ? c->u.bound_check.lo : c->u.bound_check.hi; /* saturate */
+            *val = (*val < c->u.bound_check.lo) ? c->u.bound_check.lo : c->u.bound_check.hi;
             warn_(warnings, "bound_check: v%d %s clamped", prim, dim == 0 ? "x" : "y");
         }
     }
@@ -575,7 +881,6 @@ int smazka_resolve(Document *doc) {
     resolve_edge_connects(doc, &warnings);
     resolve_hierarchy(doc, &warnings);
     resolve_state_machines(doc, &warnings);
-
     if (now_us() > deadline) { warnings |= 0x80000000; return warnings; }
 
     resolve_lp(doc, &warnings);
@@ -610,7 +915,6 @@ static Constraint *add_c(Document *d, uint8_t section, uint8_t subtype) {
     return c;
 }
 
-
 int main(void) {
     int failures = 0;
     Document doc;
@@ -619,7 +923,7 @@ int main(void) {
     doc.config.max_ms = 50;
     doc.clock.frame = 0.0;
 
-    /* ── Test 1: cycle A->B->C->A marks ALL members ── */
+    /* ── Test 1: cycle A->B->C->A detected ── */
     {
         doc.prims.n_nodes = 3;
         Constraint *p;
@@ -627,13 +931,11 @@ int main(void) {
         p = add_c(&doc, SEC_STRUCTURAL, S_PARENT); p->u.parent.child = 2; p->u.parent.parent = 1;
         p = add_c(&doc, SEC_STRUCTURAL, S_PARENT); p->u.parent.child = 0; p->u.parent.parent = 2;
         int w = smazka_resolve(&doc);
-        /* v1.1 bug: only 2 of 3 members marked; here cycle() is internal so we
-           assert on the warning count instead: one cycle => >= 1 warning. */
         if (!(w & ~0x80000000u)) { printf("FAIL test1: no cycle warning\n"); failures++; }
         else printf("PASS test1: A->B->C->A cycle detected (%d warnings)\n", w & 0x7FFFFFFF);
     }
 
-    /* ── Test 2: acyclic chain produces no cycle warning ── */
+    /* ── Test 2: acyclic chain resolves clean ── */
     {
         memset(&doc, 0, sizeof(doc)); doc.config.max_iter = MAX_ITER_DEFAULT; doc.config.max_ms = 50;
         doc.prims.n_nodes = 4;
@@ -649,7 +951,6 @@ int main(void) {
     /* ── Test 3: state machine weights track triggers (not uniform 1/n) ── */
     {
         memset(&doc, 0, sizeof(doc)); doc.config.max_iter = MAX_ITER_DEFAULT; doc.config.max_ms = 50;
-        /* 3 states; t0: 0->1 over 10 frames starting at 0; t1: 0->2 over 10 frames */
         doc.prims.n_nodes = 3;
         Constraint *sm = add_c(&doc, SEC_ASSERT, A_STATE_MACHINE);
         sm->u.state_machine.state_id = 0;
@@ -666,17 +967,16 @@ int main(void) {
         double w0[3] = { sm->u.state_machine.weights[0], sm->u.state_machine.weights[1],
                          sm->u.state_machine.weights[2] };
         int w0_ok = w0[0] == 1.0 && w0[1] == 0.0 && w0[2] == 0.0;
-        doc.clock.frame = 5.0;   /* both transitions 50% ramped */
+        doc.clock.frame = 5.0;
         smazka_resolve(&doc);
         double *w = sm->u.state_machine.weights;
         int w5_ok = fabs(w[0] - 0.5) < 1e-9 && fabs(w[1] - 0.25) < 1e-9 && fabs(w[2] - 0.25) < 1e-9;
-        /* uniform blend would give (1/3,1/3,1/3) at frame 5 — the v1.1 bug */
         int not_uniform = fabs(w[0] - 1.0/3.0) > 1e-6;
         if (w0_ok && w5_ok && not_uniform)
             printf("PASS test3: weights track triggers: frame0=(%.2f,%.2f,%.2f) frame5=(%.2f,%.2f,%.2f)\n",
                    w0[0], w0[1], w0[2], w[0], w[1], w[2]);
-        else { printf("FAIL test3: frame0=(%.2f,%.2f,%.2f) frame5=(%.2f,%.2f,%.2f)\n",
-                      w0[0], w0[1], w0[2], w[0], w[1], w[2]); failures++; }
+        else { printf("FAIL test3\n"); failures++; }
+        free(sm->u.state_machine.trans);
     }
 
     /* ── Test 4: bound_check clamps and warns ── */
@@ -705,6 +1005,95 @@ int main(void) {
             printf("PASS test5: edge_connects repaired e0 to (1,0)\n");
         else { printf("FAIL test5\n"); failures++; }
     }
+
+#ifdef SMZ_HAVE_PSOLVE
+    /* ── Test 6: LP bbox_clamp + L1 least-change pulls to nearest feasible ── */
+    {
+        memset(&doc, 0, sizeof(doc)); doc.config.max_iter = MAX_ITER_DEFAULT; doc.config.max_ms = 200;
+        doc.prims.n_vertices = 1;
+        doc.prims.vertices[0].x = to_q16(0.0); doc.prims.vertices[0].y = to_q16(0.0);
+        Constraint *bb = add_c(&doc, SEC_CONSTRAINT, C_BBOX_CLAMP);
+        bb->u.bbox.prim = 0;
+        bb->u.bbox.x_min = to_q16(10.0); bb->u.bbox.y_min = to_q16(10.0);
+        bb->u.bbox.x_max = to_q16(20.0); bb->u.bbox.y_max = to_q16(20.0);
+        int w = smazka_resolve(&doc);
+        double x = from_q16(doc.prims.vertices[0].x), y = from_q16(doc.prims.vertices[0].y);
+        int ok = fabs(x - 10.0) < 1e-3 && fabs(y - 10.0) < 1e-3 && !(w & 0x7FFFFFFF);
+        if (ok) printf("PASS test6: LP bbox: (0,0) -> (%.2f,%.2f) in bbox [10,20]^2\n", x, y);
+        else { printf("FAIL test6: got (%.2f,%.2f)\n", x, y); failures++; }
+    }
+
+    /* ── Test 7: LP linear_eq 2x+y=40 from (10,10); unique L1 optimum (15,10) ── */
+    {
+        memset(&doc, 0, sizeof(doc)); doc.config.max_iter = MAX_ITER_DEFAULT; doc.config.max_ms = 200;
+        doc.prims.n_vertices = 1;
+        doc.prims.vertices[0].x = to_q16(10.0); doc.prims.vertices[0].y = to_q16(10.0);
+        Constraint *bb = add_c(&doc, SEC_CONSTRAINT, C_BBOX_CLAMP);
+        bb->u.bbox.prim = 0;
+        bb->u.bbox.x_min = to_q16(0.0); bb->u.bbox.y_min = to_q16(0.0);
+        bb->u.bbox.x_max = to_q16(40.0); bb->u.bbox.y_max = to_q16(40.0);
+        Constraint *le = add_c(&doc, SEC_CONSTRAINT, C_LINEAR_EQ);
+        le->u.linear.n_terms = 2;
+        le->u.linear.var_ids[0] = 0; le->u.linear.coeffs[0] = to_q16(2.0);
+        le->u.linear.var_ids[1] = 1; le->u.linear.coeffs[1] = to_q16(1.0);
+        le->u.linear.rhs = to_q16(40.0);
+        smazka_resolve(&doc);
+        double x = from_q16(doc.prims.vertices[0].x), y = from_q16(doc.prims.vertices[0].y);
+        int ok = fabs(x - 15.0) < 1e-2 && fabs(y - 10.0) < 1e-2;
+        if (ok) printf("PASS test7: LP linear_eq: 2x+y=40 from (10,10) -> (%.2f,%.2f)\n", x, y);
+        else { printf("FAIL test7: got (%.2f,%.2f)\n", x, y); failures++; }
+    }
+
+    /* ── Test 8: LP min_dist SLP separates two vertices to >= 10 ── */
+    {
+        memset(&doc, 0, sizeof(doc)); doc.config.max_iter = 32; doc.config.max_ms = 250;
+        doc.prims.n_vertices = 2;
+        doc.prims.vertices[0].x = to_q16(0.0); doc.prims.vertices[0].y = to_q16(0.0);
+        doc.prims.vertices[1].x = to_q16(1.0); doc.prims.vertices[1].y = to_q16(0.0);
+        Constraint *md = add_c(&doc, SEC_CONSTRAINT, C_MIN_DIST);
+        md->u.min_dist.prim_a = 0; md->u.min_dist.prim_b = 1;
+        md->u.min_dist.distance = to_q16(10.0);
+        smazka_resolve(&doc);
+        double dx = from_q16(doc.prims.vertices[1].x) - from_q16(doc.prims.vertices[0].x);
+        double dy = from_q16(doc.prims.vertices[1].y) - from_q16(doc.prims.vertices[0].y);
+        double d = sqrt(dx * dx + dy * dy);
+        int ok = d >= 10.0 - 1e-3;
+        if (ok) printf("PASS test8: LP min_dist SLP: distance %.3f >= 10\n", d);
+        else { printf("FAIL test8: distance %.3f < 10\n", d); failures++; }
+    }
+
+    /* ── Test 9: QP fair_blend max-entropy weights = 1/3 each ── */
+    {
+        memset(&doc, 0, sizeof(doc)); doc.config.max_iter = MAX_ITER_DEFAULT; doc.config.max_ms = 200;
+        Constraint *fb = add_c(&doc, SEC_CONSTRAINT, C_FAIR_BLEND);
+        fb->u.fair_blend.n_vars = 3;
+        fb->u.fair_blend.var_ids[0] = 0; fb->u.fair_blend.var_ids[1] = 1; fb->u.fair_blend.var_ids[2] = 2;
+        smazka_resolve(&doc);
+        double *w = fb->u.fair_blend.weights;
+        int ok = fabs(w[0] - 1.0/3.0) < 1e-6 && fabs(w[1] - 1.0/3.0) < 1e-6 && fabs(w[2] - 1.0/3.0) < 1e-6;
+        if (ok) printf("PASS test9: QP fair_blend weights = (%.4f,%.4f,%.4f)\n", w[0], w[1], w[2]);
+        else { printf("FAIL test9: weights = (%.4f,%.4f,%.4f)\n", w[0], w[1], w[2]); failures++; }
+    }
+
+    /* ── Test 10: QP min_stretch pulls vertex back toward rest, bounded ── */
+    {
+        memset(&doc, 0, sizeof(doc)); doc.config.max_iter = MAX_ITER_DEFAULT; doc.config.max_ms = 200;
+        doc.prims.n_vertices = 1; doc.prims.n_nodes = 1;
+        doc.prims.vertices[0].x = to_q16(500.0); doc.prims.vertices[0].y = to_q16(500.0);
+        doc.prims.nodes[0].content_ref = 0;
+        Constraint *bb = add_c(&doc, SEC_CONSTRAINT, C_BBOX_CLAMP);
+        bb->u.bbox.prim = 0;
+        bb->u.bbox.x_min = to_q16(0.0); bb->u.bbox.y_min = to_q16(0.0);
+        bb->u.bbox.x_max = to_q16(100.0); bb->u.bbox.y_max = to_q16(100.0);
+        Constraint *ms = add_c(&doc, SEC_CONSTRAINT, C_MIN_STRETCH);
+        ms->u.min_stretch.node_id = 0; ms->u.min_stretch.weight = to_q16(1.0);
+        smazka_resolve(&doc);
+        double x = from_q16(doc.prims.vertices[0].x), y = from_q16(doc.prims.vertices[0].y);
+        int ok = fabs(x - 100.0) < 1e-2 && fabs(y - 100.0) < 1e-2;
+        if (ok) printf("PASS test10: QP min_stretch: (500,500) w/ bbox[0,100] -> (%.2f,%.2f)\n", x, y);
+        else { printf("FAIL test10: got (%.2f,%.2f)\n", x, y); failures++; }
+    }
+#endif /* SMZ_HAVE_PSOLVE */
 
     if (failures) { printf("%d TEST(S) FAILED\n", failures); return 1; }
     printf("ALL RESOLVER TESTS PASSED\n");
