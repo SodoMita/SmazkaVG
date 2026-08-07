@@ -1,7 +1,7 @@
 # SmazkaVG v1.3 Formal Specification
 
 > Flat Document Model · LP + Convex QP Solver · Fixed-Point Determinism
-> Revision 1.4 — 2026-08-07
+> Revision 1.4.1 — 2026-08-07
 > Supersedes v1.1 (SMT-era) and v1.2 (namespace split). This revision
 > documents the reference rasterizer (`src/rasterizer.c`) and resolver
 > (`src/resolver.c`) as shipped: psolve LP/QP backend, Poisson diffusion
@@ -48,6 +48,7 @@
 | v1.3.1 | Audit pass: parser bounds-checking, ear-clipping face fills, true taper rendering, curve-aware diffusion brush, resolver fixes (cycle detection, state-machine activation, SLP min_dist). |
 | v1.3.2 | psolve integration: submodule + `libpsolve.a`; resolver LP/QP phases implemented (L1 least-change, SLP with post-solve check, fair_blend/min_stretch QPs); `make solver-test` with 10-test self-suite. |
 | v1.4 | Diffusion curves are a real discrete Laplace (Poisson) solve (SOR, bounded, deterministic) instead of a signed-distance brush. Stroke caps (round/butt/square; round caps form round joins). Self-contained PNG output. `tools/smazka-solve` applies the resolver to a file end-to-end. Resolver `rig` QP implemented (translation-only equilibrium). |
+| v1.4.1 | **Node transforms applied**: affine transforms (scale→skew→rotate→translate, node ID order) are baked into the vertex store for vertex/edge content. **Face holes**: `f <outer edges> | <hole edges> [| ...] [fill]` filled with even-odd rule (curved holes tessellated). Parser fixes: fill colors starting with decimal digits (e.g. `88AA00`) parse correctly; inline `#` comments no longer leak into the fill. Binary container encodes/decodes holes and 8-digit face fills. Resolver `rig` switched to psolve's **fixed-point PGS** boxed QP (integer-exact Q16.16). |
 
 ---
 
@@ -261,16 +262,20 @@ Offset  Size  Field     Description
 0x00    1     type     0x03
 0x01    1     pad      Reserved (0x00)
 0x02    2     id       uint16 global face ID
-0x04    2     n_edges  uint16 number of edges in face boundary
-0x06    2     n_holes  uint16 number of hole loops (0 in v1.3)
+0x04    2     n_edges  uint16 number of edges in outer boundary
+0x06    2     n_holes  uint16 number of hole loops
 0x08    4     fill     uint32 inline fill color 0xRRGGBB (0 = none; `p solid_fill` overrides)
-0x0C    4×n   edges    uint16[] edge IDs in boundary order
+0x0C    4×n   edges    uint16[] outer edge IDs in boundary order
+       4×m   holes     for each hole: n_hole_edges(u16), edge IDs[]
 ```
 
 The boundary is a **closed chain**: consecutive edges share a vertex. A reader
-must reconstruct the ordered boundary and may use ear-clipping to fill concave
-or curved-boundary faces. Faces are filled with a `p solid_fill` paint record,
-or with the inline `fill` field if present.
+reconstructs each loop's ordered boundary and fills with the **even-odd rule**
+across the outer loop and all hole loops, so donuts and counter shapes
+(e.g. the counters of "O" or "B" as paths) render correctly. Curved boundary
+edges are tessellated before the point-in-polygon test. Faces are filled with
+a `p solid_fill` paint record, or with the inline `fill` field if present.
+Hole-free faces may be filled with ear-clipping (faster).
 
 ### 4.5 Stroke Record (variable size)
 
@@ -313,6 +318,16 @@ Offset  Size  Field          Description
 0x18    4     skew           Q16.16 skew factor
 0x1C    4     content_ref    uint32 reference to primitive ID this node transforms (0 = none)
 ```
+
+**Transform semantics (v1.4.1, applied by the reference rasterizer):**
+`content_ref` is resolved against the vertex ID space first, then the edge ID
+space (offset by `n_vertices`). A vertex transform updates the vertex position;
+an edge transform updates both endpoint vertices and the edge's control points.
+The convention per node is `p' = R(rotation)·( S(sx,sy)·p + skew-shear ) + (tx,ty)`,
+and nodes are applied in **ID order**, so stacked nodes compose deterministically.
+Transforms are baked into the vertex store before vertex-type resolution and
+rendering — the flat model's way of emulating a hierarchy (explicit `parent`
+edges remain resolver territory, §5.2).
 
 ### 4.7 Arc Record (28 bytes)
 
@@ -537,9 +552,12 @@ widths; the LP objective is **L1 least-change** against the document input
 closest to the input.  `min_dist` / `collision_free` run the SLP loop
 (§5.4.1) with a post-solve satisfaction check.  The QP phase solves
 `fair_blend` (max-entropy weights) and `min_stretch` (elastic pull) per
-constraint; `min_curvature` / `ik_target` / `rig` remain documented stubs
-(§11.1).  All psolve calls are wrapped in the library's `psolve_try`/`psolve_end`
-error protocol so an out-of-memory inside the solver unwinds cleanly.
+constraint, and `rig` (cyclic-parent equilibrium) with psolve's **fixed-point
+projected-Gauss-Seidel boxed QP** (`pgs_fixed.h`) so the equilibrium solve is
+integer-exact in Q16.16 — bit-identical across platforms. `min_curvature` /
+`ik_target` remain documented stubs (§11.1).  All psolve calls are wrapped in
+the library's `psolve_try`/`psolve_end` error protocol so an out-of-memory
+inside the solver unwinds cleanly.
 
 ### 6.3 Resolution Order (deterministic)
 
@@ -577,8 +595,8 @@ v <id> <x> <y> [vtype]
 # Edges (curve type + control points optional)
 e <id> <v_start> <v_end> [type=<seg|quad|cubic|rational|catmull> [cp...] [w...]]
 
-# Faces (inline fill optional, overridden by p solid_fill)
-f <id> <edge_0> <edge_1> ... <edge_n> [fill_RRGGBB]
+# Faces (inline fill optional, overridden by p solid_fill; '|' starts a hole loop)
+f <id> <edge_0> <edge_1> ... <edge_n> [| <hole_edge_0> ...] [fill_RRGGBB]
 
 # Strokes (cap optional: round|butt|square)
 s <id> <edge_id> <color> <w_0> <w_1> ... <w_n> [cap=<round|butt|square>]
@@ -646,7 +664,7 @@ edge         = "e" SP eid SP vid SP vid [SP edge-params]
 edge-params  = "type=" curve-type SP *(number)
 curve-type   = "seg" / "quad" / "cubic" / "rational" / "catmull"
 
-face         = "f" SP fid SP 1*(eid) [SP hexcolor]
+face         = "f" SP fid SP 1*(eid) *(SP "|" SP 1*(eid)) [SP hexcolor]
 stroke       = "s" SP sid SP eid SP hexcolor SP 1*(number) [SP "cap=" cap]
 cap          = "round" / "butt" / "square"
 

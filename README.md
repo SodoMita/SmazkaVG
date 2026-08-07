@@ -2,7 +2,7 @@
 
 **A flat, binary-first vector graphics format with embedded LP + convex QP constraint solvers.**
 
-> Version 1.4 — Specification, reference rasterizer, resolver, and tooling
+> Version 1.4.1 — Specification, reference rasterizer, resolver, and tooling
 
 ---
 
@@ -10,7 +10,7 @@
 
 SmazkaVG is a next-generation vector graphics format designed for:
 
-- **Anime/Illustration production** — topology-aware shared edges, Poisson diffusion curves, variable-width strokes with caps/joins
+- **Anime/Illustration production** — topology-aware shared edges, Poisson diffusion curves, variable-width strokes with caps/joins, node transforms, hole-aware faces
 - **CAD/Web interchange** — deterministic fixed-point arithmetic, compact binary encoding
 - **LLM-friendly editing** — flat Line-ASM textual projection (~50% fewer tokens than JSON/XML)
 - **Code golf / generative art** — a byte-starved dialect compiler (`tools/smazka-golf`)
@@ -48,6 +48,11 @@ SmazkaVG/
 │   ├── triangle_v1.2.smazka           # Curved-edge face fill
 │   ├── eyelash_v1.2.smazka            # Tapered anime lash + diffusion
 │   ├── curves_v1.3.smazka             # All curve types + arc + ellipse
+│   ├── diffusion_demo.smazka          # Poisson diffusion curves
+│   ├── joints_demo.smazka             # Stroke caps & joins
+│   ├── donut.smazka                   # Face holes (even-odd fill)
+│   ├── nodes_demo.smazka              # Node transforms
+│   ├── solve_demo.smazka              # smazka-solve constraint demo
 │   └── golf_face.sg / golf_face.smazka# Golf dialect demo
 └── tests/
     └── run_tests.sh                   # Build + hardening + regression + solver + round-trip

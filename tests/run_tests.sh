@@ -180,6 +180,64 @@ print("  PASS: diffusion boundary colors + smooth harmonic gradient + falloff")
 EOF
 check "diffusion solves Poisson correctly" "[ $? -eq 0 ]"
 
+echo "== face holes =="
+"$BUILD/smazka-raster" examples/donut.smazka 256 256 >/dev/null 2>&1
+python3 - "$ROOT" <<'EOF'
+import sys
+from PIL import Image
+import numpy as np
+im = np.asarray(Image.open(sys.argv[1] + '/examples/donut.png').convert('RGB')).astype(int)
+fill = (np.abs(im[:,:,0]-0xFF)<=8)&(np.abs(im[:,:,1]-0xAA)<=8)&(np.abs(im[:,:,2]-0)<=8)
+sc, ox, oy = 0.4333, 41.33, 63.0
+def px(wx,wy): return (int(round(ox+wx*sc)), int(round(oy+wy*sc)))
+hx,hy = px(200,160)
+assert not fill[hy,hx], "hole center should be empty"
+rx,ry = px(80,80)
+assert fill[ry,rx], "ring should be filled"
+fx,fy = px(400,300)
+assert not fill[fy,fx], "outside should be empty"
+print("  PASS: donut hole empty, ring filled, outside empty")
+EOF
+check "face holes render correctly" "[ $? -eq 0 ]"
+
+echo "== node transforms =="
+cat > "$BUILD/t/node.smazka" <<'EOF'
+v 0 100 100
+v 1 100 0
+e 0 0 1
+n 0 tx=0 ty=100 content=0
+n 1 rot=1.5707963 content=1
+EOF
+"$BUILD/smazka-raster" "$BUILD/t/node.smazka" 256 256 >/dev/null 2>&1
+python3 - "$BUILD/t/node.bmp" <<'EOF'
+import sys
+from PIL import Image
+import numpy as np
+im = np.asarray(Image.open(sys.argv[1]).convert('RGB')).astype(int)
+marker = (im[:,:,0]>180)&(im[:,:,1]<100)&(im[:,:,2]<100)
+ys,xs = np.where(marker)
+pts = set(zip(xs.tolist(), ys.tolist()))
+def near(pts, x, y, tol=4): return any(abs(a-x)<=tol and abs(b-y)<=tol for a,b in pts)
+assert near(pts, 205, 206), "translated vertex missing"
+assert near(pts, 50, 50), "rotated vertex missing"
+print("  PASS: node translation + rotation applied")
+EOF
+check "node transforms applied" "[ $? -eq 0 ]"
+
+echo "== digit-leading fill regression =="
+printf 'v 0 0 0\nv 1 100 0\nv 2 50 86\ne 0 0 1\ne 1 1 2\ne 2 0 2\nf 0 0 1 2 88AA00\n' > "$BUILD/t/digitfill.smazka"
+"$BUILD/smazka-raster" "$BUILD/t/digitfill.smazka" 128 128 >/dev/null 2>&1
+python3 - "$BUILD/t/digitfill.bmp" <<'EOF'
+import sys
+from PIL import Image
+import numpy as np
+im = np.asarray(Image.open(sys.argv[1]).convert('RGB')).astype(int)
+f = (np.abs(im[:,:,0]-0x88)<=8)&(np.abs(im[:,:,1]-0xAA)<=8)&(np.abs(im[:,:,2]-0)<=8)
+assert f.sum() > 100, "digit-leading fill color not applied"
+print("  PASS: fill color starting with digits parses (88AA00)")
+EOF
+check "digit-leading fill parses" "[ $? -eq 0 ]"
+
 echo "== smazka-solve pipeline =="
 make solve > "$BUILD/t/solve-build.log" 2>&1
 check "smazka-solve builds" "[ $? -eq 0 ]"

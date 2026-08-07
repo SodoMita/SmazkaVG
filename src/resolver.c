@@ -58,6 +58,7 @@
 #ifdef SMZ_HAVE_PSOLVE
 #include "solver.h"
 #include "qp.h"
+#include "pgs_fixed.h"
 #include "err.h"
 #endif
 
@@ -833,14 +834,17 @@ static void resolve_qp(Document *doc, int *warnings) {
 
     /* rig: translation-only equilibrium for cyclic parent chains (v1.2
        semantics, SPEC §5.2.1).  Cycle members are flagged by
-       resolve_hierarchy (flags bit 0).  We solve the soft-consistency QP
-       over the members' world translations:
-         min  Σ_k ||x_k - x0_k||²  +  λ Σ_{(c,p)} ||x_c - x_p - t_c||²
-       where t_c is node c's local offset.  λ is large so consistent cycles
-       are satisfied exactly while the regularization anchors the global
-       translation.  The solved values are written back to the nodes' tx/ty
-       as the equilibrium world offset (rotation/scale rigs are future work;
-       see SPEC.md §11.1). */
+       resolve_hierarchy (node flags bit 0).  Solved with psolve's
+       FIXED-POINT projected Gauss-Seidel boxed QP (pgs_fixed.h), so the
+       solve is integer-exact in Q16.16 — bit-identical across platforms,
+       matching the format's fixed-point core:
+
+         minimize  Σ_k ||x_k − x0_k||² + λ Σ_edges ||x_c − x_p − t_c||²
+
+       A holds raw coefficients (not scaled); b, lo, hi, x are scaled by
+       S = 65536.  The iteration budget scales with the system size
+       (deterministic; PGS runs the full budget).  Rotation/scale rigs are
+       future work (SPEC.md §11.1). */
     for (int i = 0; i < doc->config.n_constraints; i++) {
         Constraint *c = &doc->config.constraints[i];
         if (c->section != SEC_CONSTRAINT || c->subtype != C_RIG_EQUILIBRIUM) continue;
@@ -856,26 +860,32 @@ static void resolve_qp(Document *doc, int *warnings) {
         if (m == 0) { free(map); free(idlist); continue; }
 
         int nvar = 2 * m;
-        SmallQP q;
-        q.n = nvar;
-        q.Q = (double *)calloc((size_t)nvar * nvar, sizeof(double));
-        q.c = (double *)calloc((size_t)nvar, sizeof(double));
-        q.m = 1;                                   /* trivial row 0 <= 0 */
-        q.A = (double *)calloc((size_t)nvar, sizeof(double));
-        q.b = (double *)malloc(sizeof(double));
-        if (!q.Q || !q.c || !q.A || !q.b) { warn_(warnings, "rig: alloc"); free(map); free(idlist); free(q.Q); free(q.c); free(q.A); free(q.b); continue; }
-        q.b[0] = 0.0;
-
-        const double lam = 1e6;
-        /* regularization ||x - x0||² */
+        const int64_t S = 65536;                  /* Q16.16 scale */
+        const int64_t lam = 10000;                /* consistency weight (A-scale) */
+        int64_t *A = (int64_t *)calloc((size_t)nvar * nvar, sizeof(int64_t));  /* row-major */
+        int64_t *b = (int64_t *)calloc((size_t)nvar, sizeof(int64_t));
+        int64_t *lo = (int64_t *)malloc((size_t)nvar * sizeof(int64_t));
+        int64_t *hi = (int64_t *)malloc((size_t)nvar * sizeof(int64_t));
+        int64_t *x  = (int64_t *)malloc((size_t)nvar * sizeof(int64_t));
+        if (!A || !b || !lo || !hi || !x) {
+            warn_(warnings, "rig: alloc");
+            free(A); free(b); free(lo); free(hi); free(x);
+            free(map); free(idlist);
+            continue;
+        }
         for (int k = 0; k < m; k++) {
             int nid = idlist[k];
-            q.Q[(size_t)(2 * k) * nvar + 2 * k] += 1.0;
-            q.Q[(size_t)(2 * k + 1) * nvar + 2 * k + 1] += 1.0;
-            q.c[2 * k]     -= from_q16(doc->prims.nodes[nid].tx);
-            q.c[2 * k + 1] -= from_q16(doc->prims.nodes[nid].ty);
+            /* regularization (weight 1): ½·2·(x−x0)² -> A=2, b=−2x0 */
+            A[(size_t)(2 * k) * nvar + 2 * k] += 2;
+            A[(size_t)(2 * k + 1) * nvar + 2 * k + 1] += 2;
+            b[2 * k]     -= 2 * (int64_t)doc->prims.nodes[nid].tx;
+            b[2 * k + 1] -= 2 * (int64_t)doc->prims.nodes[nid].ty;
+            x[2 * k]     = doc->prims.nodes[nid].tx;      /* warm start */
+            x[2 * k + 1] = doc->prims.nodes[nid].ty;
+            lo[2 * k] = INT32_MIN; hi[2 * k] = INT32_MAX; /* full Q16.16 range */
+            lo[2 * k + 1] = INT32_MIN; hi[2 * k + 1] = INT32_MAX;
         }
-        /* consistency edges: parent relationships among cycle members */
+        /* consistency edges among cycle members: λ(x_c − x_p − t)² */
         for (int ci = 0; ci < doc->config.n_constraints; ci++) {
             Constraint *cc = &doc->config.constraints[ci];
             if (cc->section != SEC_STRUCTURAL || cc->subtype != S_PARENT) continue;
@@ -883,33 +893,42 @@ static void resolve_qp(Document *doc, int *warnings) {
             int cm = (child >= 0 && child < N) ? map[child] : -1;
             int pm = (parent >= 0 && parent < N) ? map[parent] : -1;
             if (cm < 0 || pm < 0) continue;
-            double tx = from_q16(doc->prims.nodes[child].tx);
-            double ty = from_q16(doc->prims.nodes[child].ty);
+            int64_t tx = doc->prims.nodes[child].tx;
+            int64_t ty = doc->prims.nodes[child].ty;
             int ccx = 2 * cm, ccy = ccx + 1, cpx = 2 * pm, cpy = cpx + 1;
-            q.Q[(size_t)ccx * nvar + ccx] += lam;
-            q.Q[(size_t)ccy * nvar + ccy] += lam;
-            q.Q[(size_t)cpx * nvar + cpx] += lam;
-            q.Q[(size_t)cpy * nvar + cpy] += lam;
-            q.Q[(size_t)ccx * nvar + cpx] -= lam;
-            q.Q[(size_t)cpx * nvar + ccx] -= lam;
-            q.Q[(size_t)ccy * nvar + cpy] -= lam;
-            q.Q[(size_t)cpy * nvar + ccy] -= lam;
-            q.c[ccx] -= lam * tx;
-            q.c[ccy] -= lam * ty;
-            q.c[cpx] += lam * tx;
-            q.c[cpy] += lam * ty;
+            A[(size_t)ccx * nvar + ccx] += 2 * lam;
+            A[(size_t)ccy * nvar + ccy] += 2 * lam;
+            A[(size_t)cpx * nvar + cpx] += 2 * lam;
+            A[(size_t)cpy * nvar + cpy] += 2 * lam;
+            A[(size_t)ccx * nvar + cpx] -= 2 * lam;
+            A[(size_t)cpx * nvar + ccx] -= 2 * lam;
+            A[(size_t)ccy * nvar + cpy] -= 2 * lam;
+            A[(size_t)cpy * nvar + ccy] -= 2 * lam;
+            b[ccx] -= 2 * lam * tx;
+            b[ccy] -= 2 * lam * ty;
+            b[cpx] += 2 * lam * tx;
+            b[cpy] += 2 * lam * ty;
         }
 
-        double *sol = (double *)calloc((size_t)nvar, sizeof(double));
-        if (qp_solve_small(&q, sol, warnings) == 0) {
-            for (int k = 0; k < m; k++) {
-                int nid = idlist[k];
-                doc->prims.nodes[nid].tx = to_q16(sol[2 * k]);
-                doc->prims.nodes[nid].ty = to_q16(sol[2 * k + 1]);
-            }
+        /* deterministic budget: bigger systems get proportionally fewer sweeps */
+        int max_iter = (int)(4000000 / (double)(m * m));
+        if (max_iter < 1000) max_iter = 1000;
+        if (max_iter > 200000) max_iter = 200000;
+        PGSFixedOptions opt;
+        opt.n = nvar;
+        opt.max_iter = max_iter;
+        opt.w_num = 10; opt.w_den = 10;      /* plain Gauss-Seidel */
+        opt.tol = 0;                         /* run the full budget (deterministic) */
+        PGSResult res;
+        pgsf_solve(&opt, A, b, lo, hi, x, &res);
+        for (int k = 0; k < m; k++) {
+            int nid = idlist[k];
+            doc->prims.nodes[nid].tx = (q16_t)x[2 * k];
+            doc->prims.nodes[nid].ty = (q16_t)x[2 * k + 1];
         }
-        free(sol);
-        free(q.Q); free(q.c); free(q.A); free(q.b);
+        (void)S;
+
+        free(A); free(b); free(lo); free(hi); free(x);
         free(map); free(idlist);
     }
 }

@@ -94,3 +94,68 @@ satisfying every edge within 1e-2. Rotation/scale rigs remain future work.
 | Resolver applied to files | Not possible | **tools/smazka-solve** |
 | Resolver `rig` | Stub | **Translation-only equilibrium QP** |
 | Tests | 24 | **37** (PNG, caps/joins, diffusion, solve pipeline, rig) |
+
+---
+
+## v1.4.1 — Node transforms, face holes, fixed-point PGS, parser fixes
+
+### 1. Node transforms are applied (was: parsed, never used)
+
+**Problem:** the rasterizer parsed `n` records (tx/ty/rot/sx/sy/skew/content)
+but never applied them — a core pillar of the flat model ("hierarchy emulated
+via transforms") was dead code.
+
+**Fix:** `apply_node_transforms()` bakes each node's affine transform into the
+vertex store before rendering: `content_ref` resolves to a vertex (transform
+the position) or an edge (transform both endpoints + control points, so curved
+edges move with their geometry). Convention per node:
+`p' = R(rot)·(S(sx,sy)·p + skew) + t`; nodes apply in ID order (deterministic
+composition). Verified: a translated vertex lands at the expected pixel and a
+90°-rotated vertex lands at its rotated position (examples/nodes_demo.smazka).
+
+### 2. Face holes (donuts / counters)
+
+**Problem:** faces had a single boundary — no holes, so donuts and letter
+counters were impossible.
+
+**Fix:** Line-ASM `f <id> <outer edges...> | <hole edges...> [| ...] [fill]`;
+holes fill with the **even-odd rule** across all loops (curved hole edges are
+tessellated). Hole-free faces keep the fast ear-clipping path. The SVG
+projection emits `fill-rule="evenodd"` subpaths. Verified: a square-with-square-
+hole donut leaves the hole empty and fills the ring; a curved (cubic) hole
+behaves identically (examples/donut.smazka).
+
+### 3. Resolver rig on fixed-point PGS
+
+The `rig` equilibrium QP now uses psolve's **fixed-point projected
+Gauss-Seidel** solver (`pgs_fixed.h`): `min Σ‖x−x0‖² + λΣ‖x_c−x_p−t‖²` built
+as an integer boxed QP at Q16.16 scale (A raw, b/lo/hi/x scaled), plain GS,
+deterministic full budget scaled by system size. The solve is integer-exact —
+bit-identical across platforms, matching the format's fixed-point core.
+Solver test 11 still passes (deltas 5/−15/10 exact, ~36 ms).
+
+### 4. Parser fixes (found while adding holes)
+
+- **Digit-leading fill colors**: a face fill like `88AA00` (or any color whose
+  first two hex digits are decimal digits) was parsed as an edge id — a
+  latent bug in both the rasterizer and the binary encoder. Face parsing is
+  now token-based: edge ids are pure, short decimal tokens; fill colors are
+  6/8 hex tokens.
+- **Inline comments**: `f 0 0 1 2 # note` leaked `#` into the fill field.
+  Tokens are checked after skipping whitespace, so `#` ends the record.
+- **Binary container**: face records now encode/decode hole loops, and face
+  fills round-trip as full 8-digit RRGGBBAA (a 6-digit face fill with a
+  nonzero high byte previously lost its top byte, e.g. `FFAA00` → `AA00FF`).
+
+---
+
+## Summary (v1.4.1)
+
+| Aspect | v1.4 | v1.4.1 |
+|---|---|---|
+| Node transforms | Parsed, never applied | **Applied (vertex/edge content, ID-order composition)** |
+| Face holes | None | **`|` hole loops, even-odd fill (curved holes ok)** |
+| Rig solver | Dense active-set QP | **Fixed-point PGS (integer-exact Q16.16)** |
+| Face parser | Digit-leading fills broken | **Token-based, comment-safe** |
+| Binary container | No holes; 6-digit fills lossy | **Holes + 8-digit fills** |
+| Tests | 37 | **44** (holes, node transforms, digit-fill, round-trips) |

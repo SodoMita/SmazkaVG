@@ -87,14 +87,24 @@ static struct {
 } edges[MAX_E];
 
 static int n_f;
-typedef struct { int eids[MAX_FE]; int ne; uint32_t fill; } Face;
+#define MAX_HOLES 4
+#define MAX_HOLE_E 64
+typedef struct {
+    int eids[MAX_FE];            /* outer boundary loop */
+    int ne;
+    int hole_e[MAX_HOLES][MAX_HOLE_E];   /* hole loops ('|' separated) */
+    int hole_len[MAX_HOLES];
+    int n_holes;
+    uint32_t fill;
+} Face;
 static Face faces[MAX_F];
 
 static int n_s;
 static struct { int eid; Col c; double w[MAX_W]; int nw; int cap; } strokes[MAX_S];  /* cap: 0=round 1=butt 2=square */
 
 static int n_n;
-static struct { double tx, ty, rot, sx, sy, skew; int cref; } nodes[MAX_N];
+typedef struct { double tx, ty, rot, sx, sy, skew; int cref; } Node;
+static Node nodes[MAX_N];
 
 /* arcs */
 static int n_arc;
@@ -207,16 +217,47 @@ static int parse(const char *path) {
             int id; if (sscanf(p, "f %d", &id) != 1) break;
             if (!id_ok(id, MAX_F)) { warn("line %d: f: id %d out of range [0,%d); ignored\n", lineno, id, MAX_F); break; }
             if (id >= n_f) n_f = id + 1;
+            Face *F = &faces[id];
+            memset(F, 0, sizeof(*F));
             const char *t = p;
             for (int i = 0; i < 2; i++) skip_token(&t);
-            int ne = 0, bad = 0;
-            while (*t && *t != '#' && ne < MAX_FE) {
-                int e; if (sscanf(t, "%d", &e) != 1) break;
+            int cur_loop = -1;   /* -1 = outer loop; >=0 = hole index */
+            int bad = 0;
+            while (*t && !bad) {
+                while (*t == ' ' || *t == '\t') t++;
+                if (!*t || *t == '#') break;         /* check AFTER skipping spaces */
+                if (*t == '|') {                    /* hole separator */
+                    t++;
+                    cur_loop++;
+                    if (cur_loop >= MAX_HOLES) { warn("line %d: f %d: too many holes (max %d)\n", lineno, id, MAX_HOLES); bad = 1; }
+                    continue;
+                }
+                char tok[64];
+                int nread;
+                if (sscanf(t, "%63s%n", tok, &nread) != 1) break;
+                /* disambiguate edge ids from the trailing hex fill: edge ids are
+                   short (< 10000); fill colors are 6/8 hex digits (>= 6 chars) */
+                size_t tl = strlen(tok);
+                int is_pure = 1;
+                for (size_t k = 0; k < tl; k++)
+                    if (tok[k] < '0' || tok[k] > '9') { is_pure = 0; break; }
+                if (!is_pure || tl >= 6) {           /* fill color (or unknown) */
+                    F->fill = (uint32_t)strtoul(tok, NULL, 16);
+                    break;
+                }
+                int e = atoi(tok);
                 if (!id_ok(e, MAX_E)) { warn("line %d: f %d: edge id %d out of range [0,%d); face rejected\n", lineno, id, e, MAX_E); bad = 1; break; }
-                faces[id].eids[ne++] = e; skip_token(&t);
+                if (cur_loop < 0) {
+                    if (F->ne < MAX_FE) F->eids[F->ne++] = e;
+                    else { warn("line %d: f %d: too many outer edges\n", lineno, id); bad = 1; }
+                } else {
+                    if (F->hole_len[cur_loop] < MAX_HOLE_E) F->hole_e[cur_loop][F->hole_len[cur_loop]++] = e;
+                    else { warn("line %d: f %d: too many hole edges\n", lineno, id); bad = 1; }
+                }
+                t += nread;
             }
-            faces[id].ne = bad ? 0 : ne;
-            if (*t && *t != '#') faces[id].fill = (uint32_t)strtoul(t, NULL, 16);
+            F->n_holes = (cur_loop >= 0 && !bad) ? cur_loop + 1 : 0;
+            if (bad) { F->ne = 0; F->n_holes = 0; }
             break;
         }
         case 's': {
@@ -391,11 +432,18 @@ static void validate_doc(void) {
             int e = faces[i].eids[k];
             if (!id_ok(e, n_e) || edges[e].v0 < 0) { warn("f %d references invalid edge %d; fill skipped\n", i, e); bad = 1; break; }
         }
-        if (bad) faces[i].ne = 0;
+        for (int h = 0; h < faces[i].n_holes && !bad; h++)
+            for (int k = 0; k < faces[i].hole_len[h]; k++) {
+                int e = faces[i].hole_e[h][k];
+                if (!id_ok(e, n_e) || edges[e].v0 < 0) { warn("f %d references invalid hole edge %d; fill skipped\n", i, e); bad = 1; break; }
+            }
+        if (bad) { faces[i].ne = 0; faces[i].n_holes = 0; }
     }
     for (int i = 0; i < n_n; i++) {
-        if (nodes[i].cref >= 0 && nodes[i].cref >= n_v && nodes[i].cref >= n_e) {
-            warn("n %d references missing content %d\n", i, nodes[i].cref);
+        int cref = nodes[i].cref;
+        int ok = (cref >= 0 && cref < n_v) || (cref >= n_v && cref - n_v < n_e);
+        if (!ok) {
+            warn("n %d references missing content %d\n", i, cref);
             nodes[i].cref = -1;
         }
     }
@@ -465,6 +513,43 @@ static void resolve_vertex_types(void) {
                     edges[e_in].cp[last].x = v.x - (pn.x - pp.x) / 6.0;
                     edges[e_in].cp[last].y = v.y - (pn.y - pp.y) / 6.0;
                 }
+            }
+        }
+    }
+}
+
+/* ─── Node transforms ───
+   Each node carries an affine transform (tx, ty, rot, sx, sy, skew) and a
+   content reference.  content_ref is resolved against the vertex ID space
+   first, then the edge ID space (offset by n_v):
+     - vertex v:   transforms verts[v].p
+     - edge e:     transforms both endpoint vertices and the edge's control
+                   points, so curved edges transform with their geometry.
+   Convention (applied per node):  p' = R(rot)·( S(sx,sy)·p + skew-shear ) + t
+   Nodes are applied in ID order, so stacked nodes compose deterministically.
+   The transforms are baked into the vertex store before vertex-type
+   resolution and rendering (the flat model's way of emulating hierarchy). */
+static V2 node_xform_p(const Node *nd, V2 p) {
+    double c = cos(nd->rot), s = sin(nd->rot);
+    double x = p.x * nd->sx;
+    double y = p.y * nd->sy;
+    x += y * nd->skew;                      /* x-shear after scale */
+    return (V2){ c * x - s * y + nd->tx, s * x + c * y + nd->ty };
+}
+
+static void apply_node_transforms(void) {
+    for (int i = 0; i < n_n; i++) {
+        Node *nd = &nodes[i];
+        if (nd->cref < 0) continue;
+        if (nd->cref < n_v) {
+            verts[nd->cref].p = node_xform_p(nd, verts[nd->cref].p);
+        } else {
+            int eid = nd->cref - n_v;
+            if (edges[eid].v0 >= 0) {
+                verts[edges[eid].v0].p = node_xform_p(nd, verts[edges[eid].v0].p);
+                verts[edges[eid].v1].p = node_xform_p(nd, verts[edges[eid].v1].p);
+                for (int k = 0; k < edges[eid].n_cp; k++)
+                    edges[eid].cp[k] = node_xform_p(nd, edges[eid].cp[k]);
             }
         }
     }
@@ -682,16 +767,14 @@ static double poly_area2(V2 *p, int n) { /* 2x signed area */
     return s;
 }
 
-/* Reconstruct the ordered chain of boundary vertex IDs for a face.
+/* Reconstruct the ordered chain of boundary vertex IDs for an edge loop.
    Returns vertex count (>=3) or 0 if the edge list is not a closed chain. */
-static int face_vertex_chain(int fid, int *vout, int cap) {
-    Face *F = &faces[fid];
-    int n = F->ne;
+static int chain_from_edges(const int *eids, int n, int *vout, int cap) {
     if (n < 3 || n > MAX_FE) return 0;
     int a[MAX_FE], b[MAX_FE];
     for (int k = 0; k < n; k++) {
-        a[k] = ss_edges[F->eids[k]].v0;
-        b[k] = ss_edges[F->eids[k]].v1;
+        a[k] = ss_edges[eids[k]].v0;
+        b[k] = ss_edges[eids[k]].v1;
     }
     /* try both orientations of the first edge (the list may run CW or CCW) */
     for (int orient = 0; orient < 2; orient++) {
@@ -728,16 +811,16 @@ static int edge_tess(int eid, V2 *out, int cap) {
     return n;
 }
 
-/* Build the screen-space boundary polygon of a face (curved edges tessellated).
-   Returns point count (>=3) or 0. */
-static int face_pts(int fid, V2 *out, int cap) {
+/* Build the screen-space boundary polygon of an edge loop (curved edges
+   tessellated).  Returns point count (>=3) or 0. */
+static int loop_pts_from_edges(const int *eids, int n, V2 *out, int cap) {
     int vchain[MAX_FE + 1];
-    int nv = face_vertex_chain(fid, vchain, MAX_FE + 1);
+    int nv = chain_from_edges(eids, n, vchain, MAX_FE + 1);
     if (!nv) return 0;
     V2 tmp[MAX_FPTS];
     int nt = 0;
     for (int k = 0; k < nv; k++) {
-        int eid = faces[fid].eids[k];
+        int eid = eids[k];
         int pn = edge_tess(eid, tmp + nt, (int)(MAX_FPTS - nt) - 1);
         nt += pn;
         if (nt >= MAX_FPTS - 2) return 0;
@@ -754,6 +837,10 @@ static int face_pts(int fid, V2 *out, int cap) {
         if (m < cap) out[m++] = out[0];
     }
     return m;
+}
+
+static int face_pts(int fid, V2 *out, int cap) {
+    return loop_pts_from_edges(faces[fid].eids, faces[fid].ne, out, cap);
 }
 
 static int pt_in_tri(V2 p, V2 a, V2 b, V2 c) {
@@ -808,10 +895,66 @@ static int face_fill_color(int fid, Col *out) {
     return 0;
 }
 
+/* Ray-cast point-in-polygon (works for concave and non-self-intersecting
+   polygons; the loop must be closed, i.e. p[0] == p[n-1] or implied). */
+static int point_in_loop(V2 P, const V2 *p, int n) {
+    int inside = 0;
+    for (int i = 0, j = n - 1; i < n; j = i++) {
+        if (((p[i].y > P.y) != (p[j].y > P.y)) &&
+            (P.x < (p[j].x - p[i].x) * (P.y - p[i].y) / (p[j].y - p[i].y + 1e-30) + p[i].x))
+            inside = !inside;
+    }
+    return inside;
+}
+
+/* Even-odd fill over an outer loop plus hole loops: a pixel is filled when it
+   is inside an odd number of loops.  Handles concave boundaries, curved
+   edges (tessellated) and holes. */
+static void fill_face_evenodd(V2 **loops, int *lens, int nloops, Col c) {
+    double mnx = 1e30, mxx = -1e30, mny = 1e30, mxy = -1e30;
+    for (int l = 0; l < nloops; l++)
+        for (int i = 0; i < lens[l]; i++) {
+            double x = loops[l][i].x, y = loops[l][i].y;
+            if (x < mnx) mnx = x;
+            if (x > mxx) mxx = x;
+            if (y < mny) mny = y;
+            if (y > mxy) mxy = y;
+        }
+    int x0 = (int)floor(mnx), x1 = (int)ceil(mxx);
+    int y0 = (int)floor(mny), y1 = (int)ceil(mxy);
+    if (x0 < 0) x0 = 0;
+    if (x1 >= FW) x1 = FW - 1;
+    if (y0 < 0) y0 = 0;
+    if (y1 >= FH) y1 = FH - 1;
+    for (int y = y0; y <= y1; y++) {
+        for (int x = x0; x <= x1; x++) {
+            V2 P = { x + 0.5, y + 0.5 };
+            int cnt = 0;
+            for (int l = 0; l < nloops; l++) cnt += point_in_loop(P, loops[l], lens[l]);
+            if (cnt & 1) fb_blend(x, y, c.r, c.g, c.b, c.a);
+        }
+    }
+}
+
 static void fill_face(int fid) {
     Col fc;
     if (!face_fill_color(fid, &fc)) return;
     if (faces[fid].ne < 3) return;
+    if (faces[fid].n_holes > 0) {
+        V2 outer[MAX_FPTS];
+        V2 holes[MAX_HOLES][MAX_FPTS / 2];
+        int n_outer = face_pts(fid, outer, MAX_FPTS);
+        if (n_outer < 3) return;
+        V2 *loops[1 + MAX_HOLES];
+        int lens[1 + MAX_HOLES];
+        loops[0] = outer; lens[0] = n_outer;
+        int nloops = 1;
+        for (int h = 0; h < faces[fid].n_holes; h++) {
+            int n = loop_pts_from_edges(faces[fid].hole_e[h], faces[fid].hole_len[h], holes[h], MAX_FPTS / 2);
+            if (n >= 3) { loops[nloops] = holes[h]; lens[nloops] = n; nloops++; }
+        }
+        if (nloops > 1) { fill_face_evenodd(loops, lens, nloops, fc); return; }
+    }
     V2 pts[MAX_FPTS];
     int n = face_pts(fid, pts, MAX_FPTS);
     if (n >= 3) fill_poly(pts, n, fc);
@@ -1409,12 +1552,14 @@ static void write_svg(const char *path) {
                 arcs[i].c.r, arcs[i].c.g, arcs[i].c.b, arcs[i].c.a / 255.0, arcs[i].lw * sc);
     }
 
-    /* Faces (tessellated boundary polygon, same as the raster fill) */
+    /* Faces (tessellated boundary polygon(s), same as the raster fill; holes
+       become even-odd subpaths) */
     for (int fi = 0; fi < n_f; fi++) {
         if (faces[fi].ne < 3) continue;
         Col fc;
         if (!face_fill_color(fi, &fc)) continue;
         V2 pts[MAX_FPTS];
+        V2 holes[MAX_HOLES][MAX_FPTS / 2];
         int n = face_pts(fi, pts, MAX_FPTS);
         if (n < 3) continue;
         fprintf(f, "  <path d=\"M ");
@@ -1422,7 +1567,21 @@ static void write_svg(const char *path) {
             if (k == 0) fprintf(f, "%.2f,%.2f", pts[k].x, pts[k].y);
             else fprintf(f, " L %.2f,%.2f", pts[k].x, pts[k].y);
         }
-        fprintf(f, " Z\" fill=\"rgba(%d,%d,%d,%.2f)\"/>\n", fc.r, fc.g, fc.b, fc.a / 255.0);
+        fprintf(f, " Z");
+        if (faces[fi].n_holes > 0) {
+            for (int h = 0; h < faces[fi].n_holes; h++) {
+                int hn = loop_pts_from_edges(faces[fi].hole_e[h], faces[fi].hole_len[h], holes[h], MAX_FPTS / 2);
+                if (hn < 3) continue;
+                for (int k = 0; k < hn; k++) {
+                    if (k == 0) fprintf(f, " M %.2f,%.2f", holes[h][k].x, holes[h][k].y);
+                    else fprintf(f, " L %.2f,%.2f", holes[h][k].x, holes[h][k].y);
+                }
+                fprintf(f, " Z");
+            }
+            fprintf(f, "\" fill=\"rgba(%d,%d,%d,%.2f)\" fill-rule=\"evenodd\"/>\n", fc.r, fc.g, fc.b, fc.a / 255.0);
+        } else {
+            fprintf(f, "\" fill=\"rgba(%d,%d,%d,%.2f)\"/>\n", fc.r, fc.g, fc.b, fc.a / 255.0);
+        }
     }
 
     /* Diffusion (linear gradient along the spine, for SVG renderers) */
@@ -1537,8 +1696,9 @@ int main(int argc, char **argv) {
     if (h > 4096) h = 4096;
 
     if (parse(inp) != 0) return 1;
-    resolve_vertex_types();
     validate_doc();
+    apply_node_transforms();
+    resolve_vertex_types();
 
     int nq = 0, nc = 0, nr = 0, nm = 0;
     for (int i = 0; i < n_e; i++) {

@@ -156,15 +156,32 @@ static int enc(const char *inp, const char *outp) {
             int id; if (sscanf(p, "%d", &id) != 1) break;
             const char *t = p; skip_tok(&t);   /* skip the record id only */
             int ne = 0; int eids[64]; char fill[16] = "";
-            while (*t && *t != '#' && ne < 64) {
-                int e;
-                if (sscanf(t, "%d", &e) == 1) { eids[ne++] = e; skip_tok(&t); }
-                else break;
+            int n_holes = 0; int hlen[4]; int hole[4][64];
+            int cur_loop = -1;
+            while (*t) {
+                while (*t == ' ' || *t == '\t') t++;
+                if (!*t || *t == '#') break;          /* check AFTER skipping spaces */
+                if (*t == '|') { t++; cur_loop++; if (cur_loop < 4) hlen[cur_loop] = 0; continue; }
+                char tok[64]; int nread;
+                if (sscanf(t, "%63s%n", tok, &nread) != 1) break;
+                size_t tl = strlen(tok);
+                int is_pure = 1;
+                for (size_t k = 0; k < tl; k++)
+                    if (tok[k] < '0' || tok[k] > '9') { is_pure = 0; break; }
+                if (!is_pure || tl >= 6) { strncpy(fill, tok, 15); break; }
+                int e = atoi(tok);
+                if (cur_loop < 0) { if (ne < 64) eids[ne++] = e; }
+                else if (cur_loop < 4 && hlen[cur_loop] < 64) hole[cur_loop][hlen[cur_loop]++] = e;
+                t += nread;
             }
-            while (*t == ' ') t++;
-            if (*t && *t != '#') strncpy(fill, t, 15);
+            n_holes = (cur_loop >= 0) ? cur_loop + 1 : 0;
             fputc(0x03, out); wu(out, (uint32_t)id); wu(out, (uint32_t)ne);
             for (int i = 0; i < ne; i++) wu(out, (uint32_t)eids[i]);
+            wu(out, (uint32_t)n_holes);
+            for (int h = 0; h < n_holes; h++) {
+                wu(out, (uint32_t)hlen[h]);
+                for (int i = 0; i < hlen[h]; i++) wu(out, (uint32_t)hole[h][i]);
+            }
             wu(out, fill[0] ? (uint32_t)color_val(fill) : 0);
             counts[2]++;
             break;
@@ -315,7 +332,7 @@ static void dec(const char *inp, const char *outp) {
     FILE *in = fopen(inp, "rb");
     if (!in) { fprintf(stderr, "bin: cannot open %s\n", inp); return; }
     FILE *out = stdout;
-    if (outp) { out = fopen(outp, "w"); if (!out) { fprintf(stderr, "bin: cannot write %s\n", outp); return; } }
+    if (outp && strcmp(outp, "-") != 0) { out = fopen(outp, "w"); if (!out) { fprintf(stderr, "bin: cannot write %s\n", outp); return; } }
 
     char magic[4]; size_t got = fread(magic, 1, 4, in);
     if (got != 4 || memcmp(magic, "SMVG", 4) != 0) { fprintf(stderr, "bin: not a SmazkaVG container\n"); return; }
@@ -349,8 +366,14 @@ static void dec(const char *inp, const char *outp) {
         case 0x03: { int id = (int)ru(in), ne = (int)ru(in);
             fprintf(out, "f %d", id);
             for (int i = 0; i < ne; i++) fprintf(out, " %d", (int)ru(in));
+            int nh = (int)ru(in);
+            for (int h = 0; h < nh; h++) {
+                int hl = (int)ru(in);
+                fprintf(out, " |");
+                for (int i = 0; i < hl; i++) fprintf(out, " %d", (int)ru(in));
+            }
             uint32_t fill = (uint32_t)ru(in);
-            if (fill) fprintf(out, " %06X", fill & 0xFFFFFF);
+            if (fill) fprintf(out, " %08X", fill);
             fprintf(out, "\n"); break; }
         case 0x04: { int id = (int)ru(in), eid = (int)ru(in);
             uint32_t col = (uint32_t)ru(in); int nw = (int)ru(in);
