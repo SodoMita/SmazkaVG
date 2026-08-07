@@ -1,7 +1,7 @@
 # SmazkaVG v1.3 Formal Specification
 
 > Flat Document Model · LP + Convex QP Solver · Fixed-Point Determinism
-> Revision 1.4.1 — 2026-08-07
+> Revision 1.5 — 2026-08-07
 > Supersedes v1.1 (SMT-era) and v1.2 (namespace split). This revision
 > documents the reference rasterizer (`src/rasterizer.c`) and resolver
 > (`src/resolver.c`) as shipped: psolve LP/QP backend, Poisson diffusion
@@ -49,6 +49,7 @@
 | v1.3.2 | psolve integration: submodule + `libpsolve.a`; resolver LP/QP phases implemented (L1 least-change, SLP with post-solve check, fair_blend/min_stretch QPs); `make solver-test` with 10-test self-suite. |
 | v1.4 | Diffusion curves are a real discrete Laplace (Poisson) solve (SOR, bounded, deterministic) instead of a signed-distance brush. Stroke caps (round/butt/square; round caps form round joins). Self-contained PNG output. `tools/smazka-solve` applies the resolver to a file end-to-end. Resolver `rig` QP implemented (translation-only equilibrium). |
 | v1.4.1 | **Node transforms applied**: affine transforms (scale→skew→rotate→translate, node ID order) are baked into the vertex store for vertex/edge content. **Face holes**: `f <outer edges> | <hole edges> [| ...] [fill]` filled with even-odd rule (curved holes tessellated). Parser fixes: fill colors starting with decimal digits (e.g. `88AA00`) parse correctly; inline `#` comments no longer leak into the fill. Binary container encodes/decodes holes and 8-digit face fills. Resolver `rig` switched to psolve's **fixed-point PGS** boxed QP (integer-exact Q16.16). |
+| v1.5 | **Animation**: `k` keyframe records drive node transforms; the rasterizer interpolates per field (piecewise-linear, partial keyframes inherit the node's base pose) and renders **frame sequences** (`--anim <fps> <frames> [--loop] [--out prefix]`) with a fixed camera covering the animation's full bounding box; single frames at a time are rendered with `--t <seconds>`. Animated GIF output is assembled from the PNG frames when PIL is available. Keyframes round-trip through the binary container; golf dialect gains `K`. |
 
 ---
 
@@ -362,6 +363,46 @@ Offset  Size  Field          Description
 0x20    4     sw             Q16.16 stroke width
 ```
 
+### 4.9 Keyframe Record (animation, v1.5)
+
+```
+Offset  Size  Field          Description
+──────  ────  ─────────────  ────────────────────────────────
+0x00    1     type           0x09
+0x01    1     pad            Reserved (0x00)
+0x02    2     id             uint16 global keyframe ID
+0x04    2     node_id        uint16 target node
+0x06    4     time           Q16.16 time in seconds (>= 0)
+0x0A    1     mask           which transform fields are set (bits: 1=tx 2=ty 4=rot 8=sx 16=sy 32=skew)
+       4×n   values         Q16.16 values for the set fields, in bit order
+```
+
+Line-ASM:
+
+```
+k <id> <node_id> <time> [tx=..] [ty=..] [rot=..] [sx=..] [sy=..] [skew=..]
+```
+
+**Semantics.** A keyframe sets a *partial* pose for a node at `time` seconds.
+Each of the six transform fields is animated independently over the keyframes
+that set it, with **piecewise-linear interpolation** and clamping outside the
+keyframe range (or time-wrapping when the renderer runs with `--loop`). Fields
+with no keyframes keep the node's base (`n` record) value, so a keyframe only
+needs to list what changes. The interpolated pose is applied with the node
+transform semantics of §4.6. To move a whole rigid shape, put one node per
+vertex (or per edge for curved shapes) and give all of them matching keyframes.
+
+**Rendering.** `smazka-raster <in> [w] [h] --anim <fps> <frames> [--loop] [--out prefix]`
+renders `<prefix>_000.png/.bmp … <prefix>_<n-1>.png/.bmp` at `t = i/fps`, with
+the camera fixed to the animation's full bounding box (base geometry plus every
+keyframe pose) so motion is visible; `--loop` wraps time modulo the last
+keyframe time. An animated GIF is assembled from the PNG frames when PIL is
+available. `--t <seconds>` renders a single frame at a time.
+
+Animation complements the resolver's constraint-driven `state_machine`
+(§5.3.1): keyframes are declarative, renderer-side motion; state machines are
+solver-side blend weights. Both can be combined.
+
 ---
 
 ## 5. Constraint Namespaces
@@ -608,6 +649,9 @@ n <id> <tx> <ty> <rot> <sx> <sy> <skew> [content_ref]
 # Arcs
 r <id> <cx> <cy> <r> <a0> <a1> <color> [lw]
 
+# Keyframes (animation; drives node transforms, v1.5)
+k <id> <node_id> <time> [tx=..] [ty=..] [rot=..] [sx=..] [sy=..] [skew=..]
+
 # Ellipses
 z <id> <cx> <cy> <rx> <ry> [rot] <fill> [stroke] [sw]
 
@@ -675,6 +719,8 @@ positional-node = number SP number SP number SP number SP number SP number [SP u
 
 arc          = "r" SP aid SP number SP number SP number SP number SP number
              SP hexcolor [SP number]
+keyframe     = "k" SP kid SP nid SP number SP *(keyval)
+keyval       = ("tx=" / "ty=" / "rot=" / "sx=" / "sy=" / "skew=") number
 ellipse      = "z" SP zid SP number SP number SP number SP number [SP number]
              SP hexcolor [SP hexcolor] [SP number]
 

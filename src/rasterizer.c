@@ -106,6 +106,27 @@ static int n_n;
 typedef struct { double tx, ty, rot, sx, sy, skew; int cref; } Node;
 static Node nodes[MAX_N];
 
+/* ─── Keyframes (animation) ───
+   k <id> <node_id> <time> [tx=..] [ty=..] [rot=..] [sx=..] [sy=..] [skew=..]
+   A labeled keyframe sets a *partial* pose at time `time` (seconds); fields
+   not listed are animated from the node's base (`n` record) values.  Per
+   field, the timeline is piecewise-linear over the keyframes that set it,
+   clamped outside the keyframe range (or wrapped when --loop is used). */
+#define MAX_KF 512
+#define KF_TX 1
+#define KF_TY 2
+#define KF_ROT 4
+#define KF_SX 8
+#define KF_SY 16
+#define KF_SKEW 32
+static int n_kf;
+static struct {
+    int node;          /* target node id */
+    double t;          /* time in seconds */
+    int mask;          /* which fields are set */
+    double v[6];       /* tx, ty, rot, sx, sy, skew */
+} kf[MAX_KF];
+
 /* arcs */
 static int n_arc;
 typedef struct { V2 center; double r, a0, a1; Col c; double lw; } Arc;
@@ -402,6 +423,45 @@ static int parse(const char *path) {
             }
             break;
         }
+        case 'k': {   /* keyframe: k <id> <node_id> <time> [tx=..] [ty=..] [rot=..] [sx=..] [sy=..] [skew=..] */
+            int id, node; double t;
+            if (sscanf(p, "k %d %d %lf", &id, &node, &t) < 3) break;
+            if (!id_ok(node, MAX_N)) { warn("line %d: k: node %d out of range [0,%d); ignored\n", lineno, node, MAX_N); break; }
+            if (t < 0) t = 0;
+            if (n_kf >= MAX_KF) { warn("line %d: too many keyframes (max %d)\n", lineno, MAX_KF); break; }
+            kf[n_kf].node = node;
+            kf[n_kf].t = t;
+            kf[n_kf].mask = 0;
+            const char *kt = p;
+            for (int i = 0; i < 3; i++) skip_token(&kt);
+            if (*kt && strchr(kt, '=')) {                 /* labeled form */
+                while (*kt) {
+                    while (*kt == ' ' || *kt == '\t') kt++;
+                    if (!*kt) break;
+                    double v; int n;
+                    if (strncmp(kt, "tx=", 3) == 0 && sscanf(kt + 3, "%lf%n", &v, &n) == 1) { kf[n_kf].v[0] = v; kf[n_kf].mask |= KF_TX; kt += 3 + n; }
+                    else if (strncmp(kt, "ty=", 3) == 0 && sscanf(kt + 3, "%lf%n", &v, &n) == 1) { kf[n_kf].v[1] = v; kf[n_kf].mask |= KF_TY; kt += 3 + n; }
+                    else if (strncmp(kt, "rot=", 4) == 0 && sscanf(kt + 4, "%lf%n", &v, &n) == 1) { kf[n_kf].v[2] = v; kf[n_kf].mask |= KF_ROT; kt += 4 + n; }
+                    else if (strncmp(kt, "sx=", 3) == 0 && sscanf(kt + 3, "%lf%n", &v, &n) == 1) { kf[n_kf].v[3] = v; kf[n_kf].mask |= KF_SX; kt += 3 + n; }
+                    else if (strncmp(kt, "sy=", 3) == 0 && sscanf(kt + 3, "%lf%n", &v, &n) == 1) { kf[n_kf].v[4] = v; kf[n_kf].mask |= KF_SY; kt += 3 + n; }
+                    else if (strncmp(kt, "skew=", 5) == 0 && sscanf(kt + 5, "%lf%n", &v, &n) == 1) { kf[n_kf].v[5] = v; kf[n_kf].mask |= KF_SKEW; kt += 5 + n; }
+                    else skip_token(&kt);
+                }
+            } else {                                      /* positional: all six fields */
+                double vals[6] = { 0, 0, 0, 1, 1, 0 };
+                int got = 0, n2;
+                for (int i = 0; i < 6 && sscanf(kt, "%lf%n", &vals[i], &n2) == 1; i++) { kt += n2; got = i + 1; }
+                if (got >= 1) { kf[n_kf].v[0] = vals[0]; kf[n_kf].mask |= KF_TX; }
+                if (got >= 2) { kf[n_kf].v[1] = vals[1]; kf[n_kf].mask |= KF_TY; }
+                if (got >= 3) { kf[n_kf].v[2] = vals[2]; kf[n_kf].mask |= KF_ROT; }
+                if (got >= 4) { kf[n_kf].v[3] = vals[3]; kf[n_kf].mask |= KF_SX; }
+                if (got >= 5) { kf[n_kf].v[4] = vals[4]; kf[n_kf].mask |= KF_SY; }
+                if (got >= 6) { kf[n_kf].v[5] = vals[5]; kf[n_kf].mask |= KF_SKEW; }
+            }
+            (void)id;
+            n_kf++;
+            break;
+        }
         default:
             warn("line %d: unknown command '%c'\n", lineno, cmd);
             break;
@@ -553,6 +613,98 @@ static void apply_node_transforms(void) {
             }
         }
     }
+}
+
+/* base (pre-animation) snapshots — restored before every frame */
+static struct { V2 p; VType vt; } verts_base[MAX_V];
+static struct { int v0, v1; EType type; V2 cp[4]; double w[2]; int n_cp; } edges_base[MAX_E];
+static Node nodes_base[MAX_N];
+
+/* ─── Animation view ───
+   With keyframes the auto-fit camera would follow the moving geometry, hiding
+   the motion.  Instead, compute ONE view that covers the base geometry plus
+   every keyframe pose (the animation's full bounding box) and freeze it. */
+/* ─── Animation ───
+   Keyframes are evaluated per frame: the node's six transform fields are
+   each interpolated piecewise-linearly over the keyframes that set them,
+   clamped outside the keyframe range (or wrapped when looping).  Fields
+   with no keyframes keep the node's base value, so a keyframe only needs to
+   list what changes.  The resulting pose is baked into the vertex/edge
+   store exactly like a static node transform. */
+static int kf_sorted = 0;
+static int kf_order[MAX_KF];
+
+static void anim_snapshot_base(void) {
+    memcpy(verts_base, verts, sizeof(verts));
+    memcpy(edges_base, edges, sizeof(edges));
+    memcpy(nodes_base, nodes, sizeof(nodes));
+}
+static void anim_restore_base(void) {
+    memcpy(verts, verts_base, sizeof(verts));
+    memcpy(edges, edges_base, sizeof(edges));
+    memcpy(nodes, nodes_base, sizeof(nodes));
+}
+static int kf_cmp(const void *a, const void *b) {
+    int i = *(const int *)a, j = *(const int *)b;
+    if (kf[i].t < kf[j].t) return -1;
+    if (kf[i].t > kf[j].t) return 1;
+    return i - j;
+}
+/* piecewise-linear value of `field` for `node` at time t; returns 0 if the
+   field is not animated (no keyframes set it).  Uses keyframes that set the
+   field only, so mixed partial keyframes compose naturally. */
+/* map a mask bit (KF_TX..KF_SKEW) to the value index (0..5) */
+static int kf_fi(int field) {
+    int fi = 0;
+    while ((field & 1) == 0) { fi++; field >>= 1; }
+    return fi;
+}
+static int kf_field(double t, int node, int field, double *out) {
+    int lo_t = -1, hi_t = -1;      /* nearest keyframe times below / above t */
+    int fi = kf_fi(field);
+    for (int i = 0; i < n_kf; i++) {
+        int idx = kf_order[i];
+        if (kf[idx].node != node || !(kf[idx].mask & field)) continue;
+        if (kf[idx].t <= t && (lo_t < 0 || kf[idx].t > kf[lo_t].t)) { lo_t = idx; }
+        if (kf[idx].t >= t && (hi_t < 0 || kf[idx].t < kf[hi_t].t)) { hi_t = idx; }
+    }
+    if (lo_t < 0 && hi_t < 0) return 0;                 /* not animated */
+    if (lo_t < 0) { *out = kf[hi_t].v[fi]; return 1; }
+    if (hi_t < 0) { *out = kf[lo_t].v[fi]; return 1; }
+    if (lo_t == hi_t) { *out = kf[lo_t].v[fi]; return 1; }
+    double t0 = kf[lo_t].t, t1 = kf[hi_t].t;
+    double f = (t1 > t0) ? (t - t0) / (t1 - t0) : 1.0;
+    *out = kf[lo_t].v[fi] * (1 - f) + kf[hi_t].v[fi] * f;
+    return 1;
+}
+
+/* Evaluate all keyframes at time t (seconds) and bake node transforms.
+   Call after anim_restore_base(). */
+static void apply_anim(double t, int loop) {
+    if (n_kf == 0) { apply_node_transforms(); return; }
+    if (!kf_sorted) {
+        for (int i = 0; i < n_kf; i++) kf_order[i] = i;
+        qsort(kf_order, (size_t)n_kf, sizeof(int), kf_cmp);
+        kf_sorted = 1;
+    }
+
+    if (loop) {
+        double tmax = 0;
+        for (int i = 0; i < n_kf; i++) if (kf[i].t > tmax) tmax = kf[i].t;
+        if (tmax > 0) { t = fmod(t, tmax); if (t < 0) t += tmax; }
+    }
+    /* nodes[] currently holds the base pose; overwrite animated fields */
+
+    for (int i = 0; i < n_n; i++) {
+        double v;
+        if (kf_field(t, i, KF_TX, &v)) nodes[i].tx = v;
+        if (kf_field(t, i, KF_TY, &v)) nodes[i].ty = v;
+        if (kf_field(t, i, KF_ROT, &v)) nodes[i].rot = v;
+        if (kf_field(t, i, KF_SX, &v)) nodes[i].sx = v;
+        if (kf_field(t, i, KF_SY, &v)) nodes[i].sy = v;
+        if (kf_field(t, i, KF_SKEW, &v)) nodes[i].skew = v;
+    }
+    apply_node_transforms();
 }
 
 /* ── Curve evaluation (screen-space) ─── */
@@ -714,6 +866,7 @@ static void fb_init(int w, int h) {
     memset(fb, 255, (size_t)w * h * 3);
 }
 static void fb_free(void) { free(fb); }
+static void fb_clear(void) { if (fb) memset(fb, 255, (size_t)FW * FH * 3); }
 
 static inline void fb_set(int x, int y, uint8_t r, uint8_t g, uint8_t b) {
     if ((unsigned)x < (unsigned)FW && (unsigned)y < (unsigned)FH) {
@@ -1116,7 +1269,11 @@ static void draw_ellipse(int ei) {
 }
 
 /* ── View fit ─── */
+static int view_fixed = 0;
+static double fix_ox, fix_oy, fix_sc;
+
 static void view(double *ox, double *oy, double *sc) {
+    if (view_fixed) { *ox = fix_ox; *oy = fix_oy; *sc = fix_sc; return; }
     double mnx = 1e30, mxx = -1e30, mny = 1e30, mxy = -1e30;
     int any = 0;
     for (int i = 0; i < n_v; i++) {
@@ -1159,6 +1316,72 @@ static void view(double *ox, double *oy, double *sc) {
     *ox = m - mnx * (*sc) + ((FW - 2 * m) - sw * (*sc)) * 0.5;
     *oy = m - mny * (*sc) + ((FH - 2 * m) - sh * (*sc)) * 0.5;
 }
+static void bbox_pt(V2 p, double *mnx, double *mny, double *mxx, double *mxy) {
+    if (p.x < *mnx) *mnx = p.x;
+    if (p.x > *mxx) *mxx = p.x;
+    if (p.y < *mny) *mny = p.y;
+    if (p.y > *mxy) *mxy = p.y;
+}
+static void node_bbox_at_pose(const Node *pose,
+                              double *mnx, double *mny, double *mxx, double *mxy) {
+    int cref = pose->cref;
+    if (cref < 0) return;
+    if (cref < n_v) {
+        bbox_pt(node_xform_p(pose, verts_base[cref].p), mnx, mny, mxx, mxy);
+    } else {
+        int eid = cref - n_v;
+        if (eid < 0 || eid >= n_e || edges_base[eid].v0 < 0) return;
+        bbox_pt(node_xform_p(pose, verts_base[edges_base[eid].v0].p), mnx, mny, mxx, mxy);
+        bbox_pt(node_xform_p(pose, verts_base[edges_base[eid].v1].p), mnx, mny, mxx, mxy);
+        for (int k = 0; k < edges_base[eid].n_cp; k++)
+            bbox_pt(node_xform_p(pose, edges_base[eid].cp[k]), mnx, mny, mxx, mxy);
+    }
+}
+static void anim_compute_view(void) {
+    double mnx = 1e30, mny = 1e30, mxx = -1e30, mxy = -1e30;
+    int any = 0;
+    for (int i = 0; i < n_v; i++) { bbox_pt(verts_base[i].p, &mnx, &mny, &mxx, &mxy); any = 1; }
+    for (int i = 0; i < n_e; i++)
+        for (int j = 0; j < edges_base[i].n_cp; j++) { bbox_pt(edges_base[i].cp[j], &mnx, &mny, &mxx, &mxy); any = 1; }
+    for (int i = 0; i < n_arc; i++) {
+        bbox_pt((V2){ arcs[i].center.x - arcs[i].r, arcs[i].center.y }, &mnx, &mny, &mxx, &mxy);
+        bbox_pt((V2){ arcs[i].center.x + arcs[i].r, arcs[i].center.y }, &mnx, &mny, &mxx, &mxy);
+        bbox_pt((V2){ arcs[i].center.x, arcs[i].center.y - arcs[i].r }, &mnx, &mny, &mxx, &mxy);
+        bbox_pt((V2){ arcs[i].center.x, arcs[i].center.y + arcs[i].r }, &mnx, &mny, &mxx, &mxy);
+        any = 1;
+    }
+    for (int i = 0; i < n_ell; i++) {
+        bbox_pt((V2){ ells[i].c.x - ells[i].rx, ells[i].c.y }, &mnx, &mny, &mxx, &mxy);
+        bbox_pt((V2){ ells[i].c.x + ells[i].rx, ells[i].c.y }, &mnx, &mny, &mxx, &mxy);
+        bbox_pt((V2){ ells[i].c.x, ells[i].c.y - ells[i].ry }, &mnx, &mny, &mxx, &mxy);
+        bbox_pt((V2){ ells[i].c.x, ells[i].c.y + ells[i].ry }, &mnx, &mny, &mxx, &mxy);
+        any = 1;
+    }
+    /* every keyframe pose is an extreme */
+    for (int k = 0; k < n_kf; k++) {
+        Node pose = nodes_base[kf[k].node];
+        if (kf[k].mask & KF_TX)   pose.tx = kf[k].v[0];
+        if (kf[k].mask & KF_TY)   pose.ty = kf[k].v[1];
+        if (kf[k].mask & KF_ROT)  pose.rot = kf[k].v[2];
+        if (kf[k].mask & KF_SX)   pose.sx = kf[k].v[3];
+        if (kf[k].mask & KF_SY)   pose.sy = kf[k].v[4];
+        if (kf[k].mask & KF_SKEW) pose.skew = kf[k].v[5];
+        node_bbox_at_pose(&pose, &mnx, &mny, &mxx, &mxy);
+        any = 1;
+    }
+    if (!any) { fix_ox = fix_oy = 0; fix_sc = 1; }
+    else {
+        double sw = mxx - mnx; if (sw < 1) sw = 1;
+        double sh = mxy - mny; if (sh < 1) sh = 1;
+        double m = 50;
+        double sx = (FW - 2 * m) / sw, sy = (FH - 2 * m) / sh;
+        fix_sc = fmin(sx, sy);
+        fix_ox = m - mnx * fix_sc + ((FW - 2 * m) - sw * fix_sc) * 0.5;
+        fix_oy = m - mny * fix_sc + ((FH - 2 * m) - sh * fix_sc) * 0.5;
+    }
+    view_fixed = 1;
+}
+
 
 /* ─── Diffusion curves (discrete Laplace / Poisson solve) ───
    For each `p diffusion` record we solve the Laplace equation over the
@@ -1683,13 +1906,51 @@ static void strip_ext(const char *in, char *out, int sz) {
     char *d = strrchr(out, '.'); if (d) *d = 0;
 }
 
+/* ── Animated GIF from the PNG frames (best-effort, via PIL) ── */
+static void write_animated_gif(const char *prefix, int nframes, int fps) {
+    char *av[1024]; int n = 0;
+    av[n++] = "python3"; av[n++] = "-c";
+    av[n++] = "from PIL import Image; import sys; fs=sys.argv[1:-2]; imgs=[Image.open(f) for f in fs]; imgs[0].save(sys.argv[-1], save_all=True, append_images=imgs[1:], duration=1000//int(sys.argv[-2]), loop=0)";
+    char *tmpnames = (char *)malloc((size_t)nframes * 64);
+    for (int i = 0; i < nframes; i++) {
+        snprintf(tmpnames + (size_t)i * 64, 64, "%s_%03d.png", prefix, i);
+        av[n++] = tmpnames + (size_t)i * 64;
+    }
+    char fpsbuf[16], outbuf[560];
+    snprintf(fpsbuf, sizeof(fpsbuf), "%d", fps);
+    snprintf(outbuf, sizeof(outbuf), "%s.gif", prefix);
+    av[n++] = fpsbuf; av[n++] = outbuf; av[n] = NULL;
+    if (try_exec(av) == 0) fprintf(stderr, "GIF:  %s\n", outbuf);
+    free(tmpnames);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "SmazkaVG v1.4 Rasterizer\nUsage: %s <in.smazka> [w] [h]\n", argv[0]);
+        fprintf(stderr, "SmazkaVG v1.5 Rasterizer\n"
+                        "Usage: %s <in.smazka> [w] [h] [options]\n"
+                        "Options:\n"
+                        "  --anim <fps> <frames>   render a frame sequence (PNG+BMP per frame, +GIF if PIL present)\n"
+                        "  --t <seconds>           render a single frame at time t\n"
+                        "  --out <prefix>          output prefix for the frame sequence\n"
+                        "  --loop                  wrap time modulo the animation duration\n", argv[0]);
         return 1;
     }
     const char *inp = argv[1];
-    int w = (argc >= 3) ? atoi(argv[2]) : 512, h = (argc >= 4) ? atoi(argv[3]) : 512;
+    int w = 512, h = 512;
+    int anim = 0, fps = 12, nframes = 24, loop = 0;
+    double t_single = -1.0;
+    char out_prefix[560] = "";
+    /* parse [w] [h] positionals then flags */
+    int pos = 2;
+    if (pos < argc && argv[pos][0] != '-') { w = atoi(argv[pos++]); }
+    if (pos < argc && argv[pos][0] != '-') { h = atoi(argv[pos++]); }
+    for (int i = pos; i < argc; i++) {
+        if (strcmp(argv[i], "--anim") == 0 && i + 2 < argc) { fps = atoi(argv[i + 1]); nframes = atoi(argv[i + 2]); anim = 1; i += 2; }
+        else if (strcmp(argv[i], "--t") == 0 && i + 1 < argc) { t_single = atof(argv[i + 1]); i += 1; }
+        else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) { snprintf(out_prefix, sizeof(out_prefix), "%s", argv[i + 1]); i += 1; }
+        else if (strcmp(argv[i], "--loop") == 0) { loop = 1; }
+        else fprintf(stderr, "smazka: ignoring unknown option '%s'\n", argv[i]);
+    }
     if (w < 64) w = 64;
     if (h < 64) h = 64;
     if (w > 4096) w = 4096;
@@ -1697,7 +1958,8 @@ int main(int argc, char **argv) {
 
     if (parse(inp) != 0) return 1;
     validate_doc();
-    apply_node_transforms();
+    if (n_kf > 0) anim_snapshot_base();
+    else apply_node_transforms();
     resolve_vertex_types();
 
     int nq = 0, nc = 0, nr = 0, nm = 0;
@@ -1707,13 +1969,45 @@ int main(int argc, char **argv) {
         else if (edges[i].type == E_RATIONAL) nr++;
         else if (edges[i].type == E_CATMULL) nm++;
     }
-    fprintf(stderr, "v1.4: %d verts, %d edges (seg:%d quad:%d cubic:%d rat:%d cat:%d), %d faces, %d strokes, %d arcs, %d ellipses, %d warnings\n",
-            n_v, n_e, n_e - nq - nc - nr - nm, nq, nc, nr, nm, n_f, n_s, n_arc, n_ell, n_warn);
-
-    fb_init(w, h);
-    render();
+    fprintf(stderr, "v1.5: %d verts, %d edges (seg:%d quad:%d cubic:%d rat:%d cat:%d), %d faces, %d strokes, %d arcs, %d ellipses, %d keyframes, %d warnings\n",
+            n_v, n_e, n_e - nq - nc - nr - nm, nq, nc, nr, nm, n_f, n_s, n_arc, n_ell, n_kf, n_warn);
 
     char base[512]; strip_ext(inp, base, sizeof(base));
+    crc_init();
+    fb_init(w, h);
+
+    if (anim) {
+        /* frame sequence */
+        if (!out_prefix[0]) snprintf(out_prefix, sizeof(out_prefix), "%s", base);
+        fprintf(stderr, "anim: %d frames @ %d fps (t = 0 .. %.3f s), loop=%d\n", nframes, fps, (double)(nframes - 1) / fps, loop);
+        anim_compute_view();
+        for (int f = 0; f < nframes; f++) {
+            double t = (double)f / fps;
+            fb_clear();
+            if (n_kf > 0) { anim_restore_base(); apply_anim(t, loop); }
+            render();
+            char png_p[600], bmp_p[600];
+            snprintf(png_p, sizeof(png_p), "%s_%03d.png", out_prefix, f);
+            snprintf(bmp_p, sizeof(bmp_p), "%s_%03d.bmp", out_prefix, f);
+            write_png(png_p);
+            write_bmp(bmp_p);
+            fprintf(stderr, "frame %3d: t=%6.3f  %s\n", f, t, png_p);
+        }
+        write_animated_gif(out_prefix, nframes, fps);
+        return 0;
+    }
+
+    /* single frame (optionally at time t) */
+    if (n_kf > 0) {
+        double t = (t_single >= 0) ? t_single : 0.0;
+        anim_restore_base();
+        anim_compute_view();
+        apply_anim(t, loop);
+        if (t_single >= 0) fprintf(stderr, "anim: frame at t = %.3f s\n", t);
+    }
+
+    render();
+
     char bmp_p[560], webp_p[560], png_p[560], svg_p[560], txt_p[560];
     snprintf(bmp_p, sizeof(bmp_p), "%s.bmp", base);
     snprintf(webp_p, sizeof(webp_p), "%s.webp", base);
@@ -1721,7 +2015,6 @@ int main(int argc, char **argv) {
     snprintf(svg_p, sizeof(svg_p), "%s.svg", base);
     snprintf(txt_p, sizeof(txt_p), "%s.txt", base);
 
-    crc_init();
     write_png(png_p);   fprintf(stderr, "PNG:  %s (%dx%d)\n", png_p, w, h);
     write_bmp(bmp_p);   fprintf(stderr, "BMP:  %s (%dx%d, %d KB)\n", bmp_p, w, h, (54 + w * h * 3) / 1024);
     write_webp(bmp_p, webp_p); fprintf(stderr, "WebP: %s\n", webp_p);

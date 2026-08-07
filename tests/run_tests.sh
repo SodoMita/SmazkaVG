@@ -180,6 +180,82 @@ print("  PASS: diffusion boundary colors + smooth harmonic gradient + falloff")
 EOF
 check "diffusion solves Poisson correctly" "[ $? -eq 0 ]"
 
+echo "== animation: frame sequence =="
+cat > "$BUILD/t/anim.smazka" <<'EOF'
+v 0 0 0
+v 1 40 0
+v 2 40 40
+v 3 0 40
+e 0 0 1
+e 1 1 2
+e 2 2 3
+e 3 3 0
+f 0 0 1 2 3 66CCFF
+n 0 content=0
+n 1 content=1
+n 2 content=2
+n 3 content=3
+k 0 0 0.0 tx=0
+k 1 0 1.0 tx=160
+k 2 1 0.0 tx=0
+k 3 1 1.0 tx=160
+k 4 2 0.0 tx=0
+k 5 2 1.0 tx=160
+k 6 3 0.0 tx=0
+k 7 3 1.0 tx=160
+EOF
+"$BUILD/smazka-raster" "$BUILD/t/anim.smazka" 256 256 --anim 4 5 --out "$BUILD/t/animf" >/dev/null 2>&1
+python3 - "$BUILD/t" <<'EOF'
+import sys
+from PIL import Image
+import numpy as np
+t = sys.argv[1]
+def cx(i):
+    im = np.asarray(Image.open(f"{t}/animf_{i:03d}.png").convert('RGB')).astype(int)
+    fill = (np.abs(im[:,:,0]-0x66)<=8)&(np.abs(im[:,:,1]-0xCC)<=8)&(np.abs(im[:,:,2]-0xFF)<=8)
+    ys,xs = np.where(fill)
+    return xs.mean() if len(xs) else None
+xs = [cx(i) for i in range(5)]
+assert all(x is not None for x in xs), "fill missing in frames"
+assert all(xs[i] < xs[i+1] for i in range(4)), f"motion not monotonic {xs}"
+steps = [xs[i+1]-xs[i] for i in range(4)]
+assert max(steps)-min(steps) < 3, f"interpolation not uniform {steps}"
+print("  PASS: 5 frames, monotonic, uniform steps")
+EOF
+check "frame sequence renders with uniform motion" "[ $? -eq 0 ]"
+
+echo "== animation: loop wrap =="
+"$BUILD/smazka-raster" "$BUILD/t/anim.smazka" 256 256 --anim 4 8 --loop --out "$BUILD/t/animl" >/dev/null 2>&1
+python3 - "$BUILD/t" <<'EOF'
+import sys
+from PIL import Image
+import numpy as np
+t = sys.argv[1]
+def cx(i):
+    im = np.asarray(Image.open(f"{t}/animl_{i:03d}.png").convert('RGB')).astype(int)
+    fill = (np.abs(im[:,:,0]-0x66)<=8)&(np.abs(im[:,:,1]-0xCC)<=8)&(np.abs(im[:,:,2]-0xFF)<=8)
+    ys,xs = np.where(fill)
+    return xs.mean() if len(xs) else None
+xs = [cx(i) for i in range(8)]
+assert xs[4] < xs[3] - 30, f"time did not wrap (frame4={xs[4]} frame3={xs[3]})"
+print("  PASS: loop wraps time (sawtooth)")
+EOF
+check "animation loop wraps" "[ $? -eq 0 ]"
+
+echo "== animation: GIF assembly + keyframe round-trip =="
+"$BUILD/smazka-raster" examples/animation_demo.smazka 320 240 --anim 12 12 --loop --out "$BUILD/t/ad" >/dev/null 2>&1
+python3 - "$BUILD/t" <<'EOF'
+import sys, os
+from PIL import Image
+g = Image.open(sys.argv[1] + '/ad.gif')
+assert g.n_frames == 12, f"GIF frames {g.n_frames}"
+print("  PASS: animated GIF has 12 frames")
+EOF
+check "animated GIF assembled" "[ $? -eq 0 ]"
+"$BUILD/smazka-bin" enc examples/animation_demo.smazka "$BUILD/t/ad.smvg" 2>/dev/null
+"$BUILD/smazka-bin" dec "$BUILD/t/ad.smvg" "$BUILD/t/ad.rt" 2>/dev/null
+check "keyframes round-trip through binary container" "[ "$(grep -c '^k ' examples/animation_demo.smazka)" = "$(grep -c '^k ' "$BUILD/t/ad.rt")" ]"
+
 echo "== face holes =="
 "$BUILD/smazka-raster" examples/donut.smazka 256 256 >/dev/null 2>&1
 python3 - "$ROOT" <<'EOF'

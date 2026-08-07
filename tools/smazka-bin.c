@@ -292,6 +292,30 @@ static int enc(const char *inp, const char *outp) {
             }
             break;
         }
+        case 'k': {   /* keyframe: k <id> <node> <time> [labeled fields] */
+            int id, node; double t;
+            if (sscanf(p, "%d %d %lf", &id, &node, &t) < 3) break;
+            const char *kt = p; for (int i = 0; i < 3; i++) skip_tok(&kt);
+            int mask = 0; double v[6] = {0,0,0,1,1,0};
+            while (*kt) {
+                while (*kt == ' ' || *kt == '\t') kt++;
+                if (!*kt) break;
+                double val; int n;
+                if (strncmp(kt, "tx=", 3) == 0 && sscanf(kt+3, "%lf%n", &val, &n) == 1) { v[0]=val; mask|=1; kt+=3+n; }
+                else if (strncmp(kt, "ty=", 3) == 0 && sscanf(kt+3, "%lf%n", &val, &n) == 1) { v[1]=val; mask|=2; kt+=3+n; }
+                else if (strncmp(kt, "rot=", 4) == 0 && sscanf(kt+4, "%lf%n", &val, &n) == 1) { v[2]=val; mask|=4; kt+=4+n; }
+                else if (strncmp(kt, "sx=", 3) == 0 && sscanf(kt+3, "%lf%n", &val, &n) == 1) { v[3]=val; mask|=8; kt+=3+n; }
+                else if (strncmp(kt, "sy=", 3) == 0 && sscanf(kt+3, "%lf%n", &val, &n) == 1) { v[4]=val; mask|=16; kt+=3+n; }
+                else if (strncmp(kt, "skew=", 5) == 0 && sscanf(kt+5, "%lf%n", &val, &n) == 1) { v[5]=val; mask|=32; kt+=5+n; }
+                else skip_tok(&kt);
+            }
+            fputc(0x09, out); wu(out, (uint32_t)id); wu(out, (uint32_t)node);
+            wq(out, t);
+            fputc(mask, out);
+            for (int b = 0; b < 6; b++) if (mask & (1 << b)) wq(out, v[b]);
+            counts[4]++;   /* keyframes share the node counter slot */
+            break;
+        }
         case 'p': {
             int id; char k[32];
             if (sscanf(p, "%d %31s", &id, k) < 2) break;
@@ -380,6 +404,19 @@ static void dec(const char *inp, const char *outp) {
             fgetc(in);   /* cap: reserved */
             fprintf(out, "s %d %d %08X", id, eid, col);
             for (int i = 0; i < nw; i++) fprintf(out, " %.6f", rq(in));
+            fprintf(out, "\n"); break; }
+        case 0x09: { int id = (int)ru(in), node = (int)ru(in);
+            double t = rq(in);
+            int mask = fgetc(in);
+            double v[6] = {0,0,0,1,1,0};
+            for (int b = 0; b < 6; b++) if (mask & (1 << b)) v[b] = rq(in);
+            fprintf(out, "k %d %d %.6f", id, node, t);
+            if (mask & 1)  fprintf(out, " tx=%.6f", v[0]);
+            if (mask & 2)  fprintf(out, " ty=%.6f", v[1]);
+            if (mask & 4)  fprintf(out, " rot=%.6f", v[2]);
+            if (mask & 8)  fprintf(out, " sx=%.6f", v[3]);
+            if (mask & 16) fprintf(out, " sy=%.6f", v[4]);
+            if (mask & 32) fprintf(out, " skew=%.6f", v[5]);
             fprintf(out, "\n"); break; }
         case 0x06: { int id = (int)ru(in);
             double tx = rq(in), ty = rq(in), rot = rq(in), sx = rq(in), sy = rq(in), skew = rq(in);
