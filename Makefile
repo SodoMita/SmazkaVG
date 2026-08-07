@@ -16,20 +16,23 @@ PSOLVE_LIB := $(BUILD)/libpsolve.a
 
 all: raster golf bin resolver-test
 
-raster: src/rasterizer.c
+$(BUILD):
+	mkdir -p $@
+
+raster: $(BUILD) src/rasterizer.c
 	$(CC) $(CFLAGS) -o $(BUILD)/smazka-raster src/rasterizer.c -lm
 
-golf: tools/smazka-golf.c
+golf: $(BUILD) tools/smazka-golf.c
 	$(CC) $(CFLAGS) -o $(BUILD)/smazka-golf tools/smazka-golf.c -lm
 
-bin: tools/smazka-bin.c
+bin: $(BUILD) tools/smazka-bin.c
 	$(CC) $(CFLAGS) -o $(BUILD)/smazka-bin tools/smazka-bin.c
 
-resolver-test: src/resolver.c
+resolver-test: $(BUILD) src/resolver.c
 	$(CC) $(CFLAGS) -DSMZ_STANDALONE -o $(BUILD)/resolver-test src/resolver.c -lm
 
 # psolve-backed resolver (LP + convex QP via the submodule)
-$(PSOLVE_LIB):
+$(PSOLVE_LIB): $(BUILD)
 	@if [ ! -f $(PSOLVE)/src/solver.h ]; then \
 		echo "psolve submodule not checked out; run:  git submodule update --init"; \
 		exit 1; \
