@@ -860,6 +860,7 @@ static double ss_dist_to_edge(V2 P, int eid) { return dist_to_edge_t(P, eid, NUL
 /* ─── Framebuffer ─── */
 static int FW, FH;
 static uint8_t *fb; /* RGB */
+static int g_debug_overlay = 0; /* --debug-overlay: raw edge guides + red vertex markers */
 
 static void fb_init(int w, int h) {
     FW = w; FH = h; fb = (uint8_t *)malloc((size_t)w * h * 3);
@@ -1536,7 +1537,8 @@ static void render(void) {
     for (int pi = 0; pi < n_pcon; pi++)
         if (pcon[pi].t == 0) draw_diffusion(pi);
 
-    /* Edge outlines (per-pixel, thin) */
+    /* Edge outlines (per-pixel, thin) — debug overlay only */
+    if (g_debug_overlay)
     for (int ei = 0; ei < n_e; ei++) {
         if (ss_edges[ei].v0 < 0) continue;
         V2 p0 = ss_verts[ss_edges[ei].v0], p3 = ss_verts[ss_edges[ei].v1];
@@ -1579,7 +1581,8 @@ static void render(void) {
         draw_arc(i);
     }
 
-    /* Vertices */
+    /* Vertices — debug overlay only */
+    if (g_debug_overlay)
     for (int vi = 0; vi < n_v; vi++) {
         V2 sp = ss_verts[vi];
         int cx = (int)sp.x, cy = (int)sp.y;
@@ -1819,7 +1822,8 @@ static void write_svg(const char *path) {
         fprintf(f, "  <line x1=\"%.2f\" y1=\"%.2f\" x2=\"%.2f\" y2=\"%.2f\" stroke=\"url(#d%d)\" stroke-width=\"8\" opacity=\"0.6\"/>\n", a.x, a.y, b.x, b.y, pi);
     }
 
-    /* Edges */
+    /* Edges — debug overlay only */
+    if (g_debug_overlay)
     for (int ei = 0; ei < n_e; ei++) {
         if (edges[ei].v0 < 0) continue;
         V2 sa = s2s(verts[edges[ei].v0].p, ox, oy, sc), sb = s2s(verts[edges[ei].v1].p, ox, oy, sc);
@@ -1856,7 +1860,8 @@ static void write_svg(const char *path) {
         }
     }
 
-    /* Vertices */
+    /* Vertices — debug overlay only */
+    if (g_debug_overlay)
     for (int vi = 0; vi < n_v; vi++) {
         V2 sp = s2s(verts[vi].p, ox, oy, sc);
         const char *vt = "corner";
@@ -1932,7 +1937,10 @@ int main(int argc, char **argv) {
                         "  --anim <fps> <frames>   render a frame sequence (PNG+BMP per frame, +GIF if PIL present)\n"
                         "  --t <seconds>           render a single frame at time t\n"
                         "  --out <prefix>          output prefix for the frame sequence\n"
-                        "  --loop                  wrap time modulo the animation duration\n", argv[0]);
+                        "  --loop                  wrap time modulo the animation duration\n"
+                        "  --debug-overlay         draw raw edge guides + red vertex markers (authoring aid)\n"
+                        "  --view <ox> <oy> <sc>   pin the view transform (pixel-exact mapping; 0 0 1 =\n"
+                        "                        document coords are image pixels, no auto-fit margin)\n", argv[0]);
         return 1;
     }
     const char *inp = argv[1];
@@ -1949,6 +1957,11 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--t") == 0 && i + 1 < argc) { t_single = atof(argv[i + 1]); i += 1; }
         else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) { snprintf(out_prefix, sizeof(out_prefix), "%s", argv[i + 1]); i += 1; }
         else if (strcmp(argv[i], "--loop") == 0) { loop = 1; }
+        else if (strcmp(argv[i], "--debug-overlay") == 0) { g_debug_overlay = 1; }
+        else if (strcmp(argv[i], "--view") == 0 && i + 3 < argc) {
+            fix_ox = atof(argv[i + 1]); fix_oy = atof(argv[i + 2]);
+            fix_sc = atof(argv[i + 3]); view_fixed = 1; i += 3;
+        }
         else fprintf(stderr, "smazka: ignoring unknown option '%s'\n", argv[i]);
     }
     if (w < 64) w = 64;

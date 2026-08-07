@@ -52,7 +52,16 @@ test: all
 	@mkdir -p $(BUILD)
 	bash tests/run_tests.sh
 
+# LLM dot-first vectorization toolkit (python3 + Pillow + numpy, cairosvg
+# optional but recommended). See AGENTS.md.
+llm-test: $(BUILD)/smazka-raster
+	@command -v python3 >/dev/null || { echo "python3 required"; exit 1; }
+	python3 -m tools.llm.selftest
+
+llm-demo: $(BUILD)/smazka-raster
+	cd examples/llm_workflow_demo && ./run.sh
+
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all raster golf bin resolver-test solver-test solve test clean
+.PHONY: all raster golf bin resolver-test solver-test solve test llm-test llm-demo clean

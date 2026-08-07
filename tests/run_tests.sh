@@ -284,7 +284,7 @@ e 0 0 1
 n 0 tx=0 ty=100 content=0
 n 1 rot=1.5707963 content=1
 EOF
-"$BUILD/smazka-raster" "$BUILD/t/node.smazka" 256 256 >/dev/null 2>&1
+"$BUILD/smazka-raster" "$BUILD/t/node.smazka" 256 256 --debug-overlay >/dev/null 2>&1
 python3 - "$BUILD/t/node.bmp" <<'EOF'
 import sys
 from PIL import Image

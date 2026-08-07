@@ -13,6 +13,7 @@ SmazkaVG is a next-generation vector graphics format designed for:
 - **Anime/Illustration production** — topology-aware shared edges, Poisson diffusion curves, variable-width strokes with caps/joins, node transforms, hole-aware faces, keyframe animation
 - **CAD/Web interchange** — deterministic fixed-point arithmetic, compact binary encoding
 - **LLM-friendly editing** — flat Line-ASM textual projection (~50% fewer tokens than JSON/XML)
+- **LLM-driven vectorization** — measurement + authoring + verify toolkit (`tools/llm`, see [AGENTS.md](AGENTS.md)) that turns raster line art into SmazkaVG with dot-first precision — no trace tools
 - **Code golf / generative art** — a byte-starved dialect compiler (`tools/smazka-golf`)
 
 ### Key Design Decisions
@@ -54,7 +55,14 @@ SmazkaVG/
 │   ├── nodes_demo.smazka              # Node transforms
 │   ├── animation_demo.smazka          # Keyframe animation (frame sequence)
 │   ├── solve_demo.smazka              # smazka-solve constraint demo
-│   └── golf_face.sg / golf_face.smazka# Golf dialect demo
+│   ├── golf_face.sg / golf_face.smazka# Golf dialect demo
+│   └── llm_workflow_demo/             # End-to-end LLM dot-first vectorization demo
+├── tools/llm/                         # LLM vectorization toolkit (see AGENTS.md)
+│   ├── imgscan.py                     #   measure the source raster (runs, ascii, probes)
+│   ├── author.py                      #   dot-first strokes/objects -> .smazka + preview .svg
+│   ├── verify.py                      #   precision/coverage metric + red/blue overlays
+│   ├── geometry.py                    #   catmull/polyline tessellation, chains, trimming
+│   └── selftest.py                    #   toolkit unit tests
 └── tests/
     └── run_tests.sh                   # Build + hardening + regression + solver + round-trip
 ```
@@ -91,6 +99,16 @@ make solver-test
 # binary container: lossless Line-ASM <-> .smvg
 ./build/smazka-bin enc face.smazka face.smvg
 ./build/smazka-bin dec face.smvg face2.smazka
+
+# authoring/debug aids (v1.6):
+#   --view 0 0 1        pin document coords to image pixels (no 50px auto-fit)
+#   --debug-overlay     show raw edge guides + red vertex markers (old default)
+./build/smazka-raster face.smazka 512 512 --view 0 0 1
+
+# LLM dot-first vectorization workflow (requires python3, Pillow, numpy;
+# cairosvg for the svg preview path) — full manual in AGENTS.md
+make llm-demo   # convert a synthetic line-art source end-to-end
+make llm-test   # toolkit unit tests
 ```
 
 ## Example (Line-ASM)
