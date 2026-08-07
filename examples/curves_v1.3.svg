@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
-  <!-- SmazkaVG v1.4 SVG projection -->
+  <!-- SmazkaVG v1.6 SVG projection -->
   <rect width="256" height="256" fill="white"/>
   <ellipse cx="128.00" cy="159.20" rx="31.20" ry="15.60" fill="rgba(240,240,255,1.00)" stroke="rgba(51,51,51,1.00)" stroke-width="0.78"/>
   <path d="M 109.05,162.03 A 9.13,9.13 0 1 1 99.92,152.90" stroke="rgba(136,68,0,1.00)" stroke-width="0.23" fill="none"/>

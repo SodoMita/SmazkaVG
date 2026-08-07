@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
-  <!-- SmazkaVG v1.4 SVG projection -->
+  <!-- SmazkaVG v1.6 SVG projection -->
   <rect width="256" height="256" fill="white"/>
   <path d="M 50.00,60.92 L 206.00,60.92 L 194.33,79.10 L 182.84,98.12 L 171.72,117.35 L 161.15,136.19 L 151.31,154.00 L 142.38,170.17 L 134.55,184.07 L 128.00,195.08 L 50.00,60.92 L 128.00,195.08 L 50.00,60.92 L 206.00,60.92 L 50.00,60.92 Z" fill="rgba(240,240,255,1.00)"/>
   <line id="e0" x1="50.00" y1="60.92" x2="206.00" y2="60.92" stroke="#282828" stroke-width="1.5"/>

@@ -31,6 +31,8 @@ SmazkaVG is a next-generation vector graphics format designed for:
 SmazkaVG/
 ├── README.md                          # This file
 ├── Makefile                           # make / make test / make solver-test
+├── docs/
+│   └── PLAN.md                        # Roadmap: safe/unsafe split, vectorization, interchange
 ├── spec/
 │   ├── SPEC.md                        # Formal specification (v1.6)
 │   ├── CHANGELOG_v1.2.md              # v1.1 -> v1.2 changelog
@@ -43,19 +45,20 @@ SmazkaVG/
 ├── tools/
 │   ├── smazka-golf.c                  # Code-golf dialect compiler
 │   ├── smazka-bin.c                   # Compact delta-VLQ binary container
-│   └── smazka-solve.c                 # Apply the constraint solver to a file
+│   ├── smazka-solve.c                 # Apply the constraint solver to a file
+│   └── smazka-sanitize.c              # Unsafe -> safe (.smazkavg_unsafe -> .smazkavg)
 ├── examples/
-│   ├── triangle_v1.2.smazka           # Curved-edge face fill
-│   ├── eyelash_v1.2.smazka            # Tapered anime lash + diffusion
-│   ├── curves_v1.3.smazka             # All curve types + arc + ellipse
-│   ├── diffusion_demo.smazka          # Poisson diffusion curves
-│   ├── joints_demo.smazka             # Stroke caps & joins
-│   ├── donut.smazka                   # Face holes (even-odd fill)
-│   ├── nodes_demo.smazka              # Node transforms
-│   ├── animation_demo.smazka          # Keyframe animation (frame sequence)
-│   ├── statemachine_demo.smazka       # State machine driving keyframe poses
-│   ├── solve_demo.smazka              # smazka-solve constraint demo
-│   └── golf_face.sg / golf_face.smazka# Golf dialect demo
+│   ├── triangle_v1.2.smazkavg           # Curved-edge face fill
+│   ├── eyelash_v1.2.smazkavg            # Tapered anime lash + diffusion
+│   ├── curves_v1.3.smazkavg             # All curve types + arc + ellipse
+│   ├── diffusion_demo.smazkavg          # Poisson diffusion curves
+│   ├── joints_demo.smazkavg             # Stroke caps & joins
+│   ├── donut.smazkavg                   # Face holes (even-odd fill)
+│   ├── nodes_demo.smazkavg              # Node transforms
+│   ├── animation_demo.smazkavg          # Keyframe animation (frame sequence)
+│   ├── statemachine_demo.smazkavg       # State machine driving keyframe poses
+│   ├── solve_demo.smazkavg              # smazka-solve constraint demo
+│   └── golf_face.sg / golf_face.smazkavg# Golf dialect demo
 └── tests/
     └── run_tests.sh                   # Build + hardening + regression + solver + round-trip
 ```
@@ -66,7 +69,7 @@ SmazkaVG/
 make && make test
 
 # render an example (PNG + BMP + WebP + SVG + ASCII)
-./build/smazka-raster examples/curves_v1.3.smazka 512 512
+./build/smazka-raster examples/curves_v1.3.smazkavg 512 512
 #   -> curves_v1.3.png/.bmp/.webp/.svg/.txt
 
 # resolver self-test (no solver backend)
@@ -78,24 +81,27 @@ make solver-test
 ./build/solver-test
 
 # solve constraints against a file, then render the result
-./build/smazka-solve examples/solve_demo.smazka resolved.smazka
-./build/smazka-raster resolved.smazka 512 512
+./build/smazka-solve examples/solve_demo.smazkavg resolved.smazkavg
+./build/smazka-raster resolved.smazkavg 512 512
+
+# sanitize an unsafe document (inlines inc, strips t/img/font)
+./build/smazka-sanitize art.smazkavg_unsafe art.smazkavg
 
 # animation: keyframes drive node transforms -> render a frame sequence
-./build/smazka-raster examples/animation_demo.smazka 320 240 --anim 12 24 --loop --out anim
+./build/smazka-raster examples/animation_demo.smazkavg 320 240 --anim 12 24 --loop --out anim
 #   -> anim_000.png ... anim_023.png + anim.gif (animated)
 
 # combined: a state machine blends between keyframe poses (idle->walk->jump)
-./build/smazka-raster examples/statemachine_demo.smazka 320 240 --anim 12 24 --loop --out sm
-./build/smazka-solve examples/statemachine_demo.smazka baked.smazka --t 1.5   # bake one frame
+./build/smazka-raster examples/statemachine_demo.smazkavg 320 240 --anim 12 24 --loop --out sm
+./build/smazka-solve examples/statemachine_demo.smazkavg baked.smazkavg --t 1.5   # bake one frame
 
 # golf dialect: one-token shapes, implicit IDs
-./build/smazka-golf examples/golf_face.sg face.smazka
-./build/smazka-raster face.smazka 512 512
+./build/smazka-golf examples/golf_face.sg face.smazkavg
+./build/smazka-raster face.smazkavg 512 512
 
 # binary container: lossless Line-ASM <-> .smvg
-./build/smazka-bin enc face.smazka face.smvg
-./build/smazka-bin dec face.smvg face2.smazka
+./build/smazka-bin enc face.smazkavg face.smvg
+./build/smazka-bin dec face.smvg face2.smazkavg
 ```
 
 ## Example (Line-ASM)

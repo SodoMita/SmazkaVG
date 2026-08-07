@@ -411,6 +411,30 @@ Animation complements the resolver's constraint-driven `state_machine`
 (§5.3.1): keyframes are declarative, renderer-side motion; state machines are
 solver-side blend weights. Both can be combined.
 
+### 4.10 Unsafe Records (`.smazkavg_unsafe`)
+
+```
+t <id> <x> <y> [size=..] [font=..] <"text">          # text (font reference)
+img <id> <x> <y> [w] [h] <path>                      # raster embed
+inc <path>                                           # include (inlined at load)
+font <id> <path>                                     # font library declaration
+```
+
+These records are **not part of safe SmazkaVG** and are rejected by the
+binary container. The safe pipeline converts them:
+
+| Record | Safe handling | Status |
+|---|---|---|
+| `inc` | **Inlined** at parse time (relative path, depth ≤ 8, cycle-guarded, line budget) | Implemented (rasterizer + sanitizer) |
+| `t` | Warn + skip (vectorized text is future work) | Implemented (warning) |
+| `img` | Warn + skip (centerline vectorization via LP is future work) | Implemented (warning) |
+| `font` | Warn + skip | Implemented (warning) |
+
+`tools/smazka-sanitize` converts an unsafe document into a safe `.smazkavg`
+by inlining `inc` and stripping `t`/`img`/`font` with per-record warnings;
+all other records and comments are preserved verbatim. See docs/PLAN.md for
+the raster-centerline and text-vectorization roadmap.
+
 ---
 
 ## 5. Constraint Namespaces
@@ -652,6 +676,12 @@ mask). All loops are additionally capped by `MAX_ITER`.
 ### 7.1 Design Principles
 
 - **One declaration per line** — no nesting, no indentation-based semantics.
+- **Extensions**: canonical document extension is **`.smazkavg`**; the legacy
+  `.smazka` is accepted by all tools for backward compatibility. Documents
+  that use unsafe records (`t` text, `img` raster, `font` declarations) are
+  named **`.smazkavg_unsafe`** and must be sanitized
+  (`tools/smazka-sanitize`) before interchange; constraint-solved outputs are
+  named `<name>.solved.smazkavg` (see docs/PLAN.md).
 - **`#` comments** — everything after `#` to end of line is ignored.
 - **Fixed-point literals** — decimal numbers are parsed as Q16.16 (multiplied
   by 65536 and rounded). Hex values prefixed `0x` are raw integer encodings.
@@ -897,7 +927,7 @@ The format **bans** all external references:
 - IDs and coordinates are **variable-length zigzag VLQs** (LEB128-style).
 - Coordinates are **delta-encoded** relative to the previous record of the same
   type (dx, dy), giving typical savings of 3–6× versus raw Q16.16 words.
-- Round-trips losslessly: `smazka-line2bin x.smazka > x.smvg && smazka-bin2line x.smvg` reproduces the document.
+- Round-trips losslessly: `smazka-line2bin x.smazkavg > x.smvg && smazka-bin2line x.smvg` reproduces the document.
 
 ### 11.2b Solve Pipeline (tools/smazka-solve)
 
@@ -908,10 +938,10 @@ translations updated, everything else preserved verbatim. This closes the loop
 between the constraint language and the rendered output:
 
 ```
-in.smazka ──► smazka-solve ──► resolved.smazka ──► smazka-raster ──► .png
+in.smazkavg ──► smazka-solve ──► resolved.smazkavg ──► smazka-raster ──► .png
 ```
 
-See `examples/solve_demo.smazka` (min_dist + bbox_clamp + linear_eq).
+See `examples/solve_demo.smazkavg` (min_dist + bbox_clamp + linear_eq).
 
 ### 11.3 Code-Golf Dialect (tools/smazka-golf)
 

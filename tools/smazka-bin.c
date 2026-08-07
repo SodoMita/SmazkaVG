@@ -378,6 +378,13 @@ static int enc(const char *inp, const char *outp) {
             }
             break;
         }
+        case 't': case 'i': case 'F':
+            /* cmd is the stripped command char; 'i' covers inc/img, 'F' font */
+            fprintf(stderr, "bin: error: unsafe record '%c' ('%s') — the binary container is safe-only;\n"
+                    "     run smazka-sanitize first (docs/PLAN.md)\n", cmd, p);
+            fclose(in); fclose(out);
+            remove(outp);
+            return 1;
         default: break;
         }
     }

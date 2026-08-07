@@ -20,26 +20,75 @@ cc -O2 -Wall -Wextra -o "$BUILD/smazka-golf" tools/smazka-golf.c -lm || { bad "g
 cc -O2 -Wall -Wextra -o "$BUILD/smazka-bin" tools/smazka-bin.c || { bad "bin build"; exit 1; }
 ok "all targets build"
 
+echo "== legacy .smazka extension still accepted =="
+cp examples/triangle_v1.2.smazkavg "$BUILD/t/legacy.smazka"
+"$BUILD/smazka-raster" "$BUILD/t/legacy.smazka" 128 128 >/dev/null 2>&1
+check "legacy .smazka input renders" "[ $? -eq 0 ]"
+
+echo "== include (inc) inlining + unsafe records =="
+mkdir -p "$BUILD/t/inc"
+printf 'v 10 10 10\nv 11 50 10\ne 20 10 11\n' > "$BUILD/t/inc/part.smazkavg"
+printf 'v 0 0 0\nv 1 100 0\ne 0 0 1\ninc part.smazkavg\nt 0 50 50 size=12 hi\nimg 1 10 10 40 40 logo.png\n' > "$BUILD/t/inc/main.smazkavg"
+"$BUILD/smazka-raster" "$BUILD/t/inc/main.smazkavg" 128 128 >/dev/null 2>&1
+python3 - "$BUILD/t/inc/main.smazkavg" <<'EOF'
+import sys, re
+# main(2 verts) + part(2 verts) with sparse ids 10,11 -> n_v = max_id+1 = 12
+# we can't read n_v from the render easily; check the include rendered without
+# parse errors by rendering again and scanning stderr for 'unknown'
+import subprocess
+r = subprocess.run(['./build/smazka-raster', sys.argv[1], '128', '128'],
+                   capture_output=True, text=True, cwd='.')
+err = r.stderr
+assert 'unknown command' not in err, err
+assert 'unsafe text record skipped' in err, "text record should warn"
+assert 'unsafe raster record' in err, "img record should warn"
+print("  PASS: include inlined (no parse errors), t/img warned+skipped")
+EOF
+check "include + unsafe records handled" "[ $? -eq 0 ]"
+"$BUILD/smazka-raster" "$BUILD/t/inc/cyc_a.smazkavg" 64 64 >/dev/null 2>&1 || true
+printf 'inc cyc_b.smazkavg\n' > "$BUILD/t/inc/cyc_a.smazkavg"
+printf 'inc cyc_a.smazkavg\n' > "$BUILD/t/inc/cyc_b.smazkavg"
+"$BUILD/smazka-raster" "$BUILD/t/inc/cyc_a.smazkavg" 64 64 2>&1 | grep -q "include depth"
+check "include cycle guard" "[ $? -eq 0 ]"
+
+echo "== smazka-sanitize (unsafe -> safe) =="
+make sanitize > "$BUILD/t/sanitize-build.log" 2>&1
+check "smazka-sanitize builds" "[ $? -eq 0 ]"
+"$BUILD/smazka-sanitize" "$BUILD/t/inc/main.smazkavg" "$BUILD/t/inc/main.safe" 2>/dev/null
+python3 - "$BUILD/t/inc/main.safe" <<'EOF'
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+data = [l for l in lines if l and not l.startswith('#')]
+assert 'inc ' not in ' '.join(data), "include should be inlined"
+assert not any(l.startswith(('t ', 'img ')) for l in data), "unsafe records should be stripped"
+assert any(l.startswith('v ') for l in data) and any(l.startswith('e ') for l in data), "geometry preserved"
+print("  PASS: sanitize inlines inc, strips t/img, preserves geometry")
+EOF
+check "sanitize produces a safe document" "[ $? -eq 0 ]"
+"$BUILD/smazka-raster" "$BUILD/t/inc/main.safe" 128 128 2>&1 | grep -q "0 warnings"
+check "sanitized document renders clean" "[ $? -eq 0 ]"
+
 echo "== parser hardening (no crashes) =="
-printf 'v 0 0 0\nv 999999 100 0\ne 0 0 1\n' > "$BUILD/t/evil1.smazka"
-printf 'v 0 0 0\nv 1 100 0\ne 0 0 1\n' > "$BUILD/t/evil2.smazka"
-python3 - "$BUILD/t/evil2.smazka" <<'EOF'
+printf 'v 0 0 0\nv 999999 100 0\ne 0 0 1\n' > "$BUILD/t/evil1.smazkavg"
+printf 'v 0 0 0\nv 1 100 0\ne 0 0 1\n' > "$BUILD/t/evil2.smazkavg"
+python3 - "$BUILD/t/evil2.smazkavg" <<'EOF'
 import sys
 with open(sys.argv[1], 'a') as f:
     for i in range(300):
         f.write(f'c {i} min_dist 0 1 5.0\n')
 EOF
-printf 'v -5 0 0\nv 0 0 0\nv 1 100 0\ne 0 0 1\n' > "$BUILD/t/evil3.smazka"
-printf 'v 0 0 0\nv 1 100 0\ne 0 0 999999\n' > "$BUILD/t/evil4.smazka"
+printf 'v -5 0 0\nv 0 0 0\nv 1 100 0\ne 0 0 1\n' > "$BUILD/t/evil3.smazkavg"
+printf 'v 0 0 0\nv 1 100 0\ne 0 0 999999\n' > "$BUILD/t/evil4.smazkavg"
 for t in evil1 evil2 evil3 evil4; do
-    "$BUILD/smazka-raster" "$BUILD/t/$t.smazka" 128 128 >/dev/null 2>&1
+    "$BUILD/smazka-raster" "$BUILD/t/$t.smazkavg" 128 128 >/dev/null 2>&1
     rc=$?
     check "$t: exits 0 (no segfault)" "[ $rc -eq 0 ]"
 done
 
 echo "== examples render cleanly =="
-for f in examples/*.smazka; do
-    base=$(basename "$f" .smazka)
+for f in examples/*.smazka examples/*.smazkavg; do
+    [ -f "$f" ] || continue
+    base=$(basename "$f" .smazkavg); base=${base%.smazka}
     "$BUILD/smazka-raster" "$f" 256 256 >"$BUILD/t/$base.log" 2>&1
     rc=$?
     check "$base renders (rc=0)" "[ $rc -eq 0 ]"
@@ -76,13 +125,13 @@ else
 fi
 
 echo "== golf dialect =="
-"$BUILD/smazka-golf" examples/golf_face.sg "$BUILD/t/golf.smazka"
-check "golf expands" "[ -s '$BUILD/t/golf.smazka' ]"
-"$BUILD/smazka-raster" "$BUILD/t/golf.smazka" 256 256 >/dev/null 2>&1
+"$BUILD/smazka-golf" examples/golf_face.sg "$BUILD/t/golf.smazkavg"
+check "golf expands" "[ -s '$BUILD/t/golf.smazkavg' ]"
+"$BUILD/smazka-raster" "$BUILD/t/golf.smazkavg" 256 256 >/dev/null 2>&1
 check "golf output renders" "[ $? -eq 0 ]"
 
 echo "== PNG output =="
-"$BUILD/smazka-raster" examples/triangle_v1.2.smazka 256 256 >/dev/null 2>&1
+"$BUILD/smazka-raster" examples/triangle_v1.2.smazkavg 256 256 >/dev/null 2>&1
 python3 - "$ROOT" <<'EOF'
 import sys
 from PIL import Image
@@ -96,7 +145,7 @@ EOF
 check "PNG valid + matches BMP" "[ $? -eq 0 ]"
 
 echo "== stroke caps & joins =="
-cat > "$BUILD/t/caps.smazka" <<'EOF'
+cat > "$BUILD/t/caps.smazkavg" <<'EOF'
 v 0 50 50
 v 1 100 50
 v 2 50 150
@@ -106,7 +155,7 @@ e 1 2 3
 s 0 0 FF0000 20 20 cap=round
 s 1 1 0000FF 20 20 cap=butt
 EOF
-cat > "$BUILD/t/join.smazka" <<'EOF'
+cat > "$BUILD/t/join.smazkavg" <<'EOF'
 v 0 100 100
 v 1 200 100
 v 2 100 200
@@ -115,11 +164,11 @@ e 1 0 2
 s 0 0 000000 30 30
 s 1 1 000000 30 30
 EOF
-"$BUILD/smazka-raster" "$BUILD/t/caps.smazka" 256 256 >/dev/null 2>&1
-"$BUILD/smazka-raster" "$BUILD/t/join.smazka" 256 256 >/dev/null 2>&1
-"$BUILD/smazka-raster" "$BUILD/t/join_butt.smazka" 256 256 >/dev/null 2>&1 2>/dev/null || true
-sed 's/ 30 30$/ 30 30 cap=butt/' "$BUILD/t/join.smazka" > "$BUILD/t/joinb.smazka"
-"$BUILD/smazka-raster" "$BUILD/t/joinb.smazka" 256 256 >/dev/null 2>&1
+"$BUILD/smazka-raster" "$BUILD/t/caps.smazkavg" 256 256 >/dev/null 2>&1
+"$BUILD/smazka-raster" "$BUILD/t/join.smazkavg" 256 256 >/dev/null 2>&1
+"$BUILD/smazka-raster" "$BUILD/t/join_butt.smazkavg" 256 256 >/dev/null 2>&1 2>/dev/null || true
+sed 's/ 30 30$/ 30 30 cap=butt/' "$BUILD/t/join.smazkavg" > "$BUILD/t/joinb.smazkavg"
+"$BUILD/smazka-raster" "$BUILD/t/joinb.smazkavg" 256 256 >/dev/null 2>&1
 python3 - "$BUILD/t" <<'EOF'
 import sys, os
 from PIL import Image
@@ -145,15 +194,15 @@ EOF
 check "caps + joins render correctly" "[ $? -eq 0 ]"
 
 echo "== diffusion (Poisson) =="
-cat > "$BUILD/t/diff.smazka" <<'EOF'
+cat > "$BUILD/t/diff.smazkavg" <<'EOF'
 v 0 200 50
 v 1 200 350
 e 0 0 1
 p 0 diffusion 0 L FF0000 R 0000FF
 EOF
-"$BUILD/smazka-raster" "$BUILD/t/diff.smazka" 256 256 >/dev/null 2>&1
+"$BUILD/smazka-raster" "$BUILD/t/diff.smazkavg" 256 256 >/dev/null 2>&1
 cp "$BUILD/t/diff.bmp" "$BUILD/t/diff_r1.bmp"
-"$BUILD/smazka-raster" "$BUILD/t/diff.smazka" 256 256 >/dev/null 2>&1
+"$BUILD/smazka-raster" "$BUILD/t/diff.smazkavg" 256 256 >/dev/null 2>&1
 cmp -s "$BUILD/t/diff.bmp" "$BUILD/t/diff_r1.bmp"
 check "diffusion deterministic (byte-identical reruns)" "[ $? -eq 0 ]"
 python3 - "$BUILD/t" <<'EOF'
@@ -181,7 +230,7 @@ EOF
 check "diffusion solves Poisson correctly" "[ $? -eq 0 ]"
 
 echo "== animation: frame sequence =="
-cat > "$BUILD/t/anim.smazka" <<'EOF'
+cat > "$BUILD/t/anim.smazkavg" <<'EOF'
 v 0 0 0
 v 1 40 0
 v 2 40 40
@@ -204,7 +253,7 @@ k 5 2 1.0 tx=160
 k 6 3 0.0 tx=0
 k 7 3 1.0 tx=160
 EOF
-"$BUILD/smazka-raster" "$BUILD/t/anim.smazka" 256 256 --anim 4 5 --out "$BUILD/t/animf" >/dev/null 2>&1
+"$BUILD/smazka-raster" "$BUILD/t/anim.smazkavg" 256 256 --anim 4 5 --out "$BUILD/t/animf" >/dev/null 2>&1
 python3 - "$BUILD/t" <<'EOF'
 import sys
 from PIL import Image
@@ -225,7 +274,7 @@ EOF
 check "frame sequence renders with uniform motion" "[ $? -eq 0 ]"
 
 echo "== animation: loop wrap =="
-"$BUILD/smazka-raster" "$BUILD/t/anim.smazka" 256 256 --anim 4 8 --loop --out "$BUILD/t/animl" >/dev/null 2>&1
+"$BUILD/smazka-raster" "$BUILD/t/anim.smazkavg" 256 256 --anim 4 8 --loop --out "$BUILD/t/animl" >/dev/null 2>&1
 python3 - "$BUILD/t" <<'EOF'
 import sys
 from PIL import Image
@@ -243,7 +292,7 @@ EOF
 check "animation loop wraps" "[ $? -eq 0 ]"
 
 echo "== animation: GIF assembly + keyframe round-trip =="
-"$BUILD/smazka-raster" examples/animation_demo.smazka 320 240 --anim 12 12 --loop --out "$BUILD/t/ad" >/dev/null 2>&1
+"$BUILD/smazka-raster" examples/animation_demo.smazkavg 320 240 --anim 12 12 --loop --out "$BUILD/t/ad" >/dev/null 2>&1
 python3 - "$BUILD/t" <<'EOF'
 import sys, os
 from PIL import Image
@@ -252,12 +301,12 @@ assert g.n_frames == 12, f"GIF frames {g.n_frames}"
 print("  PASS: animated GIF has 12 frames")
 EOF
 check "animated GIF assembled" "[ $? -eq 0 ]"
-"$BUILD/smazka-bin" enc examples/animation_demo.smazka "$BUILD/t/ad.smvg" 2>/dev/null
+"$BUILD/smazka-bin" enc examples/animation_demo.smazkavg "$BUILD/t/ad.smvg" 2>/dev/null
 "$BUILD/smazka-bin" dec "$BUILD/t/ad.smvg" "$BUILD/t/ad.rt" 2>/dev/null
-check "keyframes round-trip through binary container" "[ "$(grep -c '^k ' examples/animation_demo.smazka)" = "$(grep -c '^k ' "$BUILD/t/ad.rt")" ]"
+check "keyframes round-trip through binary container" "[ "$(grep -c '^k ' examples/animation_demo.smazkavg)" = "$(grep -c '^k ' "$BUILD/t/ad.rt")" ]"
 
 echo "== face holes =="
-"$BUILD/smazka-raster" examples/donut.smazka 256 256 >/dev/null 2>&1
+"$BUILD/smazka-raster" examples/donut.smazkavg 256 256 >/dev/null 2>&1
 python3 - "$ROOT" <<'EOF'
 import sys
 from PIL import Image
@@ -277,14 +326,14 @@ EOF
 check "face holes render correctly" "[ $? -eq 0 ]"
 
 echo "== node transforms =="
-cat > "$BUILD/t/node.smazka" <<'EOF'
+cat > "$BUILD/t/node.smazkavg" <<'EOF'
 v 0 100 100
 v 1 100 0
 e 0 0 1
 n 0 tx=0 ty=100 content=0
 n 1 rot=1.5707963 content=1
 EOF
-"$BUILD/smazka-raster" "$BUILD/t/node.smazka" 256 256 >/dev/null 2>&1
+"$BUILD/smazka-raster" "$BUILD/t/node.smazkavg" 256 256 >/dev/null 2>&1
 python3 - "$BUILD/t/node.bmp" <<'EOF'
 import sys
 from PIL import Image
@@ -301,8 +350,8 @@ EOF
 check "node transforms applied" "[ $? -eq 0 ]"
 
 echo "== digit-leading fill regression =="
-printf 'v 0 0 0\nv 1 100 0\nv 2 50 86\ne 0 0 1\ne 1 1 2\ne 2 0 2\nf 0 0 1 2 88AA00\n' > "$BUILD/t/digitfill.smazka"
-"$BUILD/smazka-raster" "$BUILD/t/digitfill.smazka" 128 128 >/dev/null 2>&1
+printf 'v 0 0 0\nv 1 100 0\nv 2 50 86\ne 0 0 1\ne 1 1 2\ne 2 0 2\nf 0 0 1 2 88AA00\n' > "$BUILD/t/digitfill.smazkavg"
+"$BUILD/smazka-raster" "$BUILD/t/digitfill.smazkavg" 128 128 >/dev/null 2>&1
 python3 - "$BUILD/t/digitfill.bmp" <<'EOF'
 import sys
 from PIL import Image
@@ -315,7 +364,7 @@ EOF
 check "digit-leading fill parses" "[ $? -eq 0 ]"
 
 echo "== combined animation: state machine drives keyframe poses =="
-cat > "$BUILD/t/sm.smazka" <<'EOF'
+cat > "$BUILD/t/sm.smazkavg" <<'EOF'
 v 0 0 0
 v 1 40 0
 v 2 40 40
@@ -339,7 +388,7 @@ k 5 2 0 st=1 tx=160
 k 6 3 0 st=0 tx=0
 k 7 3 0 st=1 tx=160
 EOF
-"$BUILD/smazka-raster" "$BUILD/t/sm.smazka" 256 256 --anim 4 5 --out "$BUILD/t/smf" >/dev/null 2>&1
+"$BUILD/smazka-raster" "$BUILD/t/sm.smazkavg" 256 256 --anim 4 5 --out "$BUILD/t/smf" >/dev/null 2>&1
 python3 - "$BUILD/t" <<'EOF'
 import sys
 from PIL import Image
@@ -359,8 +408,8 @@ EOF
 check "state machine drives keyframe pose blending" "[ $? -eq 0 ]"
 
 echo "== combined anim: bake a frame with smazka-solve --t =="
-"$BUILD/smazka-solve" "$BUILD/t/sm.smazka" "$BUILD/t/baked.smazka" --t 0.5 2>/dev/null
-python3 - "$BUILD/t/baked.smazka" <<'EOF'
+"$BUILD/smazka-solve" "$BUILD/t/sm.smazkavg" "$BUILD/t/baked.smazkavg" --t 0.5 2>/dev/null
+python3 - "$BUILD/t/baked.smazkavg" <<'EOF'
 import sys, re
 txs = []
 for ln in open(sys.argv[1]):
@@ -374,9 +423,9 @@ EOF
 check "smazka-solve bakes a combined-animation frame" "[ $? -eq 0 ]"
 
 echo "== combined anim: binary round-trip (st + state_machine) =="
-"$BUILD/smazka-bin" enc "$BUILD/t/sm.smazka" "$BUILD/t/sm.smvg" 2>/dev/null
+"$BUILD/smazka-bin" enc "$BUILD/t/sm.smazkavg" "$BUILD/t/sm.smvg" 2>/dev/null
 "$BUILD/smazka-bin" dec "$BUILD/t/sm.smvg" "$BUILD/t/sm.rt" 2>/dev/null
-o=$(grep -cE '^(a|k) ' "$BUILD/t/sm.smazka"); r=$(grep -cE '^(a|k) ' "$BUILD/t/sm.rt")
+o=$(grep -cE '^(a|k) ' "$BUILD/t/sm.smazkavg"); r=$(grep -cE '^(a|k) ' "$BUILD/t/sm.rt")
 check "state machine + st keyframes round-trip (${o}->${r})" "[ "$o" = "$r" ]"
 grep -q "state_machine 0 0 1 time" "$BUILD/t/sm.rt"
 check "state machine transitions survive round-trip" "[ $? -eq 0 ]"
@@ -386,7 +435,7 @@ check "keyframe st groups survive round-trip" "[ $? -eq 0 ]"
 echo "== smazka-solve pipeline =="
 make solve > "$BUILD/t/solve-build.log" 2>&1
 check "smazka-solve builds" "[ $? -eq 0 ]"
-"$BUILD/smazka-solve" examples/solve_demo.smazka "$BUILD/t/solve_demo.out" 2>/dev/null
+"$BUILD/smazka-solve" examples/solve_demo.smazkavg "$BUILD/t/solve_demo.out" 2>/dev/null
 python3 - "$BUILD/t/solve_demo.out" <<'EOF'
 import sys, re
 verts = {}
@@ -437,7 +486,7 @@ def norm(p):
     return sorted(lines)
 failures=0
 for f in ['golf_face','eyelash_v1.2','triangle_v1.2','curves_v1.3']:
-    src=f'{root}/examples/{f}.smazka'; binp=f'{build}/t/{f}.smvg'; rtp=f'{build}/t/{f}.rt.smazka'
+    src=f'{root}/examples/{f}.smazkavg'; binp=f'{build}/t/{f}.smvg'; rtp=f'{build}/t/{f}.rt.smazkavg'
     subprocess.run([f'{build}/smazka-bin','enc',src,binp], capture_output=True)
     subprocess.run([f'{build}/smazka-bin','dec',binp,rtp], capture_output=True)
     if norm(src)==norm(rtp):

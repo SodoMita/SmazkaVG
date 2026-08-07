@@ -192,17 +192,78 @@ static int read_dbl(const char **p, double *out) {
 }
 
 /* ─── Main parser ─── */
-static int parse(const char *path) {
-    FILE *f = fopen(path, "r");
-    if (!f) { fprintf(stderr, "smazka: error: cannot open '%s'\n", path); return -1; }
+/* ─── Unsafe records (v1.7) ───
+   `inc <path>`  — include another document (inlined at parse time, relative
+                  to the including file; depth-limited, cycle-guarded).  An
+                  include is SAFE once inlined.
+   `t` (text)    — UNSAFE: references fonts.  The safe pipeline vectorizes
+                  text; the reference rasterizer warns and skips it.
+   `font` (type) — UNSAFE: font library declaration (command letter 'F' is
+                  spelled 'font '; it is dispatched before the switch so it
+                  does not collide with faces).
+   `img` (raster)— UNSAFE: embeds a raster file.  The safe pipeline strips
+                  it (or optionally vectorizes its centerline via the LP
+                  solver — see docs/PLAN.md); the reference rasterizer
+                  warns and skips it.
+   Files carrying `t`/`img` are ".smazkavg_unsafe" documents; run
+   smazka-sanitize to produce a safe ".smazkavg". */
+#define MAX_INC_DEPTH 8
+#define MAX_PARSE_LINES 2000000
+static int inc_depth = 0;
+static long parse_lines = 0;
+
+static void parse_path_join(const char *dir, const char *name, char *out, int cap) {
+    if (dir && dir[0] && strchr(name, '/') == NULL && strchr(name, '\\') == NULL) {
+        snprintf(out, cap, "%s/%s", dir, name);
+    } else {
+        snprintf(out, cap, "%s", name);
+    }
+}
+static void dir_of(const char *path, char *out, int cap) {
+    snprintf(out, cap, "%s", path);
+    char *slash = strrchr(out, '/');
+#ifdef _WIN32
+    if (!slash) slash = strrchr(out, '\\');
+#endif
+    if (slash) *slash = 0;
+    else out[0] = 0;
+}
+
+static int parse_stream(FILE *f, const char *dir, int depth) {
+    if (depth > MAX_INC_DEPTH) { warn("include depth exceeds %d; cycle?\n", MAX_INC_DEPTH); return -1; }
     char ln[MAX_LINE];
     int lineno = 0;
     while (fgets(ln, sizeof(ln), f)) {
+        if (++parse_lines > MAX_PARSE_LINES) { warn("parse line budget exceeded\n"); return -1; }
         lineno++;
         char *nl = strchr(ln, '\n'); if (nl) *nl = 0;
         char *p = ln; while (*p == ' ' || *p == '\t') p++;
         if (!*p || *p == '#') continue;
         char cmd; if (sscanf(p, "%c", &cmd) != 1) continue;
+        if (cmd == 'f' && strncmp(p, "font ", 5) == 0) {   /* font declaration (unsafe) */
+            warn("line %d: unsafe font record skipped (text vectorization is future work; see docs/PLAN.md)\n", lineno);
+            continue;
+        }
+        if (cmd == 'i') {
+            if (strncmp(p, "inc ", 4) == 0) {      /* include: inc <path> */
+                char path[1024];
+                if (sscanf(p, "inc %1023s", path) == 1) {
+                    char joined[1152], fdir[1152];
+                    parse_path_join(dir, path, joined, sizeof(joined));
+                    dir_of(joined, fdir, sizeof(fdir));
+                    FILE *incf = fopen(joined, "r");
+                    if (!incf) { warn("include cannot open '%s'\n", joined); continue; }
+                    inc_depth++;
+                    parse_stream(incf, fdir, depth + 1);
+                    inc_depth--;
+                    fclose(incf);
+                    continue;
+                }
+            } else if (strncmp(p, "img ", 4) == 0) {   /* raster embed (unsafe) */
+                warn("line %d: unsafe raster record 'img' skipped (strip with smazka-sanitize; centerline vectorization is future work)\n", lineno);
+                continue;
+            }
+        }
 
         switch (cmd) {
         case 'v': {
@@ -520,13 +581,25 @@ static int parse(const char *path) {
             n_kf++;
             break;
         }
+        case 't':   /* text (unsafe: font reference) — warned + skipped by the safe pipeline */
+            warn("line %d: unsafe text record skipped (text vectorization is future work; see docs/PLAN.md)\n", lineno);
+            break;
         default:
             warn("line %d: unknown command '%c'\n", lineno, cmd);
             break;
         }
     }
-    fclose(f);
     return 0;
+}
+
+static int parse(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "smazka: error: cannot open '%s'\n", path); return -1; }
+    char fdir[1024];
+    dir_of(path, fdir, sizeof(fdir));
+    int rc = parse_stream(f, fdir, 0);
+    fclose(f);
+    return rc;
 }
 
 /* ─── Post-parse validation ─── */
@@ -2086,7 +2159,7 @@ static void write_animated_gif(const char *prefix, int nframes, int fps) {
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "SmazkaVG v1.6 Rasterizer\n"
-                        "Usage: %s <in.smazka> [w] [h] [options]\n"
+                        "Usage: %s <in.smazkavg> [w] [h] [options]\n"
                         "Options:\n"
                         "  --anim <fps> <frames>   render a frame sequence (PNG+BMP per frame, +GIF if PIL present)\n"
                         "  --t <seconds>           render a single frame at time t\n"

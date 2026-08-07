@@ -14,7 +14,7 @@ BUILD    := build
 PSOLVE   := third_party/psolve
 PSOLVE_LIB := $(BUILD)/libpsolve.a
 
-all: raster golf bin resolver-test solve
+all: raster golf bin resolver-test solve sanitize
 
 $(BUILD):
 	mkdir -p $@
@@ -48,6 +48,9 @@ solve: $(PSOLVE_LIB) tools/smazka-solve.c
 	$(CC) $(CFLAGS) -I$(PSOLVE)/src \
 	    -o $(BUILD)/smazka-solve tools/smazka-solve.c $(PSOLVE_LIB) -lm
 
+sanitize: tools/smazka-sanitize.c
+	$(CC) $(CFLAGS) -o $(BUILD)/smazka-sanitize tools/smazka-sanitize.c
+
 test: all
 	@mkdir -p $(BUILD)
 	bash tests/run_tests.sh
@@ -55,4 +58,4 @@ test: all
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all raster golf bin resolver-test solver-test solve test clean
+.PHONY: all raster golf bin resolver-test solver-test solve sanitize test clean
