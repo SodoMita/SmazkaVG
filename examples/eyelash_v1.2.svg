@@ -1,16 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 480" width="640" height="480">
-  <!-- SmazkaVG v1.2 SVG projection -->
+  <!-- SmazkaVG v1.3 SVG projection -->
   <rect width="640" height="480" fill="white"/>
-  <defs><linearGradient id="d0">
-    <stop offset="0%" stop-color="rgb(255,224,208)"/>
-    <stop offset="100%" stop-color="rgb(74,48,32)"/>
-  </linearGradient></defs>
+  <defs><linearGradient id="d0"><stop offset="0%" stop-color="rgb(255,224,208)"/><stop offset="100%" stop-color="rgb(74,48,32)"/></linearGradient></defs>
   <line x1="50.00" y1="186.00" x2="590.00" y2="186.00" stroke="url(#d0)" stroke-width="8" opacity="0.6"/>
-  <path id="e0" d="M 50.00,186.00 C 55.40,348.00 -166.00,564.00 590.00,186.00" stroke="#282828" stroke-width="1.5" fill="none"/>
-  <path id="e1" d="M 50.00,186.00 C 55.40,348.00 104.00,564.00 590.00,186.00" stroke="#282828" stroke-width="1.5" fill="none"/>
-  <path id="s0" d="M 50.00,186.00 C 55.40,348.00 -166.00,564.00 590.00,186.00" stroke="rgba(26,26,26,1.00)" stroke-width="5.40" stroke-linecap="round" fill="none"/>
-  <circle id="v0" cx="50.00" cy="186.00" r="3" fill="#dc3232"/>
-  <circle id="v1" cx="590.00" cy="186.00" r="3" fill="#dc3232"/>
-  <circle id="v2" cx="320.00" cy="294.00" r="3" fill="#dc3232"/>
+  <path id="e0" d="M 50.00,186.00 C 212.00,-30.00 428.00,-30.00 590.00,186.00" stroke="#282828" stroke-width="1.5" fill="none"/>
+  <path id="e1" d="M 50.00,186.00 C 212.00,240.00 428.00,240.00 590.00,186.00" stroke="#282828" stroke-width="1.5" fill="none"/>
+  <path id="s0" d="M 50.00,186.00 C 212.00,-30.00 428.00,-30.00 590.00,186.00" stroke="rgba(26,26,26,1.00)" stroke-width="14.04" stroke-linecap="round" fill="none"/>
+  <circle id="v0" cx="50.00" cy="186.00" r="3" fill="#dc3232" data-type="corner"/>
+  <circle id="v1" cx="590.00" cy="186.00" r="3" fill="#dc3232" data-type="corner"/>
+  <circle id="v2" cx="320.00" cy="294.00" r="3" fill="#dc3232" data-type="corner"/>
 </svg>
