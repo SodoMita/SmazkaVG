@@ -1911,7 +1911,7 @@ static void write_svg(const char *path) {
     double ox, oy, sc; view(&ox, &oy, &sc);
     fprintf(f, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     fprintf(f, "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 %d %d\" width=\"%d\" height=\"%d\">\n", FW, FH, FW, FH);
-    fprintf(f, "  <!-- SmazkaVG v1.4 SVG projection -->\n");
+    fprintf(f, "  <!-- SmazkaVG v1.6 SVG projection -->\n");
     fprintf(f, "  <rect width=\"%d\" height=\"%d\" fill=\"white\"/>\n", FW, FH);
 
     /* Ellipses */
@@ -2085,7 +2085,7 @@ static void write_animated_gif(const char *prefix, int nframes, int fps) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "SmazkaVG v1.5 Rasterizer\n"
+        fprintf(stderr, "SmazkaVG v1.6 Rasterizer\n"
                         "Usage: %s <in.smazka> [w] [h] [options]\n"
                         "Options:\n"
                         "  --anim <fps> <frames>   render a frame sequence (PNG+BMP per frame, +GIF if PIL present)\n"
@@ -2132,7 +2132,7 @@ int main(int argc, char **argv) {
         else if (edges[i].type == E_RATIONAL) nr++;
         else if (edges[i].type == E_CATMULL) nm++;
     }
-    fprintf(stderr, "v1.5: %d verts, %d edges (seg:%d quad:%d cubic:%d rat:%d cat:%d), %d faces, %d strokes, %d arcs, %d ellipses, %d keyframes, %d state machines, %d warnings\n",
+    fprintf(stderr, "v1.6: %d verts, %d edges (seg:%d quad:%d cubic:%d rat:%d cat:%d), %d faces, %d strokes, %d arcs, %d ellipses, %d keyframes, %d state machines, %d warnings\n",
             n_v, n_e, n_e - nq - nc - nr - nm, nq, nc, nr, nm, n_f, n_s, n_arc, n_ell, n_kf, n_sm, n_warn);
 
     char base[512]; strip_ext(inp, base, sizeof(base));

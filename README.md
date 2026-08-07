@@ -32,7 +32,7 @@ SmazkaVG/
 ├── README.md                          # This file
 ├── Makefile                           # make / make test / make solver-test
 ├── spec/
-│   ├── SPEC.md                        # Formal specification (v1.3)
+│   ├── SPEC.md                        # Formal specification (v1.6)
 │   ├── CHANGELOG_v1.2.md              # v1.1 -> v1.2 changelog
 │   └── CHANGELOG_v1.3.md              # v1.2 -> v1.3 / v1.3.1 changelog
 ├── src/
