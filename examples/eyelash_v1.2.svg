@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
-  <!-- SmazkaVG v1.4 SVG projection -->
-  <rect width="256" height="256" fill="white"/>
-  <defs><linearGradient id="d0" x1="50.00" y1="143.60" x2="206.00" y2="143.60"><stop offset="0%" stop-color="rgb(255,224,208)"/><stop offset="100%" stop-color="rgb(74,48,32)"/></linearGradient></defs>
-  <line x1="50.00" y1="143.60" x2="206.00" y2="143.60" stroke="url(#d0)" stroke-width="8" opacity="0.6"/>
-  <path id="s0" d="M 50.00,143.60 C 96.80,81.20 159.20,81.20 206.00,143.60" stroke="rgba(26,26,26,1.00)" stroke-width="4.06" stroke-linecap="round" fill="none"/>
-</svg>

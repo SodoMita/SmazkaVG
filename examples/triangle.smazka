@@ -1,0 +1,45 @@
+# Compact constraint-first SmazkaVG example. Record order is irrelevant.
++V a
++V b
++V c
++E ab a b
++E bc b c
++E ca c a
++F triangle ab bc ca
+
+=a.exists:bool 1
+=a.z:int 10
+?a.xy:vec2 12 10 0 100 0 100
+
+=b.exists:bool 1
+=b.z:int 11
+=b.xy:vec2 90 20
+
+=c.exists:bool 1
+=c.z:int 12
+=c.xy:vec2 50 80
+
+?ab.exists:bool 1 0 1
+=ab.z:int 30
+=ab.curve:enum seg
+=ab.width:q16 3
+=ab.color:rgba 202020FF
+
+=bc.exists:bool 1
+=bc.z:int 31
+=bc.curve:enum seg
+=bc.width:q16 3
+=bc.color:rgba 202020FF
+
+=ca.exists:bool 1
+=ca.z:int 32
+=ca.curve:enum seg
+=ca.width:q16 3
+=ca.color:rgba 202020FF
+
+=triangle.exists:bool 1
+=triangle.z:int 20
+=triangle.fill:rgba 7CC8FFFF
+
+!infeasible anchor_x a.xy.x = 10
+?degraded@20 prefer_y a.xy.y ~= 20

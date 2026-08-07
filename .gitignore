@@ -1,11 +1,7 @@
 build/
+*.svg
+*.png
 *.bmp
 *.webp
-*.svg
 *.txt
-work/
-
-# animation frame dumps (keep only the gif + samples)
-examples/anim_demo_*.png
 __pycache__/
-*_render.png
