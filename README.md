@@ -2,7 +2,7 @@
 
 **A flat, binary-first vector graphics format with embedded LP + convex QP constraint solvers.**
 
-> Version 1.5 — Specification, reference rasterizer, resolver, and tooling
+> Version 1.7 — Specification, reference rasterizer, resolver, compact text dialect, and tooling
 
 ---
 
@@ -12,9 +12,10 @@ SmazkaVG is a next-generation vector graphics format designed for:
 
 - **Anime/Illustration production** — topology-aware shared edges, Poisson diffusion curves, variable-width strokes with caps/joins, node transforms, hole-aware faces, keyframe animation
 - **CAD/Web interchange** — deterministic fixed-point arithmetic, compact binary encoding
-- **LLM-friendly editing** — flat Line-ASM textual projection (~50% fewer tokens than JSON/XML)
+- **Ultra-compact text representation** — high-density compact shorthand dialect (`.sg` / `.smz`) providing 50% to 93% text size reductions over raw Line-ASM without losing semantic clarity or precision
+- **LLM-friendly editing** — flat textual projections and authoring skin (`xauthor.h`) natively expanded at parse time by all tools
 - **LLM-driven vectorization** — measurement + authoring + verify toolkit (`tools/llm`, see [AGENTS.md](AGENTS.md)) that turns raster line art into SmazkaVG with dot-first precision — no trace tools
-- **Code golf / generative art** — a byte-starved dialect compiler (`tools/smazka-golf`)
+- **Code golf / minification** — a high-density dialect compiler and minifier (`tools/smazka-golf`)
 
 ### Key Design Decisions
 
@@ -24,6 +25,7 @@ SmazkaVG is a next-generation vector graphics format designed for:
 | **Fixed-Point Determinism** | Q16.16 (32-bit) or Q32.32 (64-bit) saturating arithmetic. No IEEE 754 in storage. |
 | **Decidable Constraints** | Constraint language restricted to **LP + convex QP** (four typed sections `s`/`a`/`c`/`p`). Non-convex QP is a parse error. Termination guaranteed by `MAX_ITER` / `MAX_MS`. |
 | **First-Class Curves** | Edges are shared 1D spines: segment, quadratic/cubic/rational Bézier, Catmull-Rom. Strokes are width profiles along the spine. |
+| **Compact Text Dialect** | Single-pass shorthand primitives (`P`, `R`, `C`, `+`, `E`, `S`, `F`, `p`, `f`), palette color names, 3/4-hex colors, relative delta coords. |
 | **Bounded Computation** | All solver iterations capped by `MAX_ITER` (default 64) and `MAX_MS` (default 50ms). |
 
 ## Repository Layout
@@ -33,16 +35,18 @@ SmazkaVG/
 ├── README.md                          # This file
 ├── Makefile                           # make / make test / make solver-test
 ├── spec/
-│   ├── SPEC.md                        # Formal specification (v1.3)
+│   ├── SPEC.md                        # Formal specification (v1.7)
 │   ├── CHANGELOG_v1.2.md              # v1.1 -> v1.2 changelog
-│   └── CHANGELOG_v1.3.md              # v1.2 -> v1.3 / v1.3.1 changelog
+│   ├── CHANGELOG_v1.3.md              # v1.2 -> v1.3 / v1.3.1 changelog
+│   └── CHANGELOG_v1.6.md              # v1.6 changelog
 ├── src/
 │   ├── rasterizer.c                   # Reference rasterizer (BMP/WebP/SVG/ASCII)
-│   └── resolver.c                     # Constraint resolver (LP/QP via psolve)
+│   ├── resolver.c                     # Constraint resolver (LP/QP via psolve)
+│   └── xauthor.h                      # Parse-time expansion for authoring skin & compact dialect
 ├── third_party/
 │   └── psolve/                        # LP + convex QP solver (git submodule)
 ├── tools/
-│   ├── smazka-golf.c                  # Code-golf dialect compiler
+│   ├── smazka-golf.c                  # Code-golf dialect compiler & minifier (-c)
 │   ├── smazka-bin.c                   # Compact delta-VLQ binary container
 │   └── smazka-solve.c                 # Apply the constraint solver to a file
 ├── examples/
@@ -59,13 +63,13 @@ SmazkaVG/
 │   └── llm_workflow_demo/             # End-to-end LLM dot-first vectorization demo
 ├── tools/llm/                         # LLM vectorization toolkit (see AGENTS.md)
 │   ├── imgscan.py                     #   measure the source raster (runs, ascii, probes)
-│   ├── author.py                      #   dot-first strokes/objects -> .smazka + preview .svg
+│   ├── author.py                      #   dot-first strokes/objects -> .smazka / .sg + preview .svg
 │   ├── verify.py                      #   precision/coverage metric + red/blue overlays
 │   ├── audit.py                       #   per-stroke garbage report: stray/hidden/dup/join/degen + overlay
 │   ├── geometry.py                    #   catmull/polyline tessellation, chains, trimming
 │   └── selftest.py                    #   toolkit unit tests
 └── tests/
-    └── run_tests.sh                   # Build + hardening + regression + solver + round-trip
+    └── run_tests.sh                   # Build + hardening + regression + solver + round-trip + compact tests
 ```
 
 ## Quick Start
@@ -77,23 +81,14 @@ make && make test
 ./build/smazka-raster examples/curves_v1.3.smazka 512 512
 #   -> curves_v1.3.png/.bmp/.webp/.svg/.txt
 
-# resolver self-test (no solver backend)
-./build/resolver-test
+# compact text representation minifier: compress Line-ASM down by 50-93%
+./build/smazka-golf -c examples/triangle_v1.2.smazka min_triangle.sg
+#   1652 bytes -> 117 bytes (93% reduction!)
 
-# solver self-test with the real psolve LP/QP backend (11 tests)
-git submodule update --init      # first time only
-make solver-test
-./build/solver-test
+# render compact shorthand files directly (xauthor.h expands at parse time)
+./build/smazka-raster min_triangle.sg 512 512
 
-# solve constraints against a file, then render the result
-./build/smazka-solve examples/solve_demo.smazka resolved.smazka
-./build/smazka-raster resolved.smazka 512 512
-
-# animation: keyframes drive node transforms -> render a frame sequence
-./build/smazka-raster examples/animation_demo.smazka 320 240 --anim 12 24 --loop --out anim
-#   -> anim_000.png ... anim_023.png + anim.gif (animated)
-
-# golf dialect: one-token shapes, implicit IDs
+# golf dialect compiler: shorthand -> Line-ASM
 ./build/smazka-golf examples/golf_face.sg face.smazka
 ./build/smazka-raster face.smazka 512 512
 
@@ -101,12 +96,12 @@ make solver-test
 ./build/smazka-bin enc face.smazka face.smvg
 ./build/smazka-bin dec face.smvg face2.smazka
 
-# authoring/debug aids (v1.6):
+# authoring/debug aids:
 #   --view 0 0 1        pin document coords to image pixels (no 50px auto-fit)
-#   --debug-overlay     show raw edge guides + red vertex markers (old default)
+#   --debug-overlay     show raw edge guides + red vertex markers
 ./build/smazka-raster face.smazka 512 512 --view 0 0 1
 
-# authoring skin (v1.6.2): symbolic ids, path/fobj/group, seam splices —
+# authoring skin: symbolic ids, path/fobj/group, seam splices —
 # the .smazka itself is the hand-edited artifact (SPEC §7.4, AGENTS.md §8)
 ./build/smazka-raster tests/dialect.smazka --xpand -      # lint/expand only
 ./build/smazka-raster tests/dialect.smazka 480 240 --view 0 0 1 --out build/dialect
@@ -117,7 +112,17 @@ make llm-demo   # convert a synthetic line-art source end-to-end
 make llm-test   # toolkit unit tests
 ```
 
-## Example (Line-ASM)
+## Compact Text Example (.sg / shorthand)
+
+```
+# Ultra-compact text representation (parsed directly by rasterizer)
+P 0 0 100 0 50 86 #f0f0ff sw=3
+E 0 1 type=cubic 80 30 60 70
+S 0 blue 3
+S 1 red 1 4 1
+```
+
+## Line-ASM Equivalent
 
 ```
 # Triangle with a curved edge, tapered stroke, and diffusion

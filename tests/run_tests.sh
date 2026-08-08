@@ -81,6 +81,30 @@ check "golf expands" "[ -s '$BUILD/t/golf.smazka' ]"
 "$BUILD/smazka-raster" "$BUILD/t/golf.smazka" 256 256 >/dev/null 2>&1
 check "golf output renders" "[ $? -eq 0 ]"
 
+echo "== text compact representation & minifier =="
+"$BUILD/smazka-golf" -c examples/golf_face.smazka "$BUILD/t/min_golf.sg"
+check "golf face minifies (-c)" "[ -s '$BUILD/t/min_golf.sg' ]"
+"$BUILD/smazka-raster" "$BUILD/t/min_golf.sg" 256 256 >"$BUILD/t/min_golf.log" 2>&1
+check "minified golf_face renders cleanly" "[ $? -eq 0 ]"
+check "minified golf_face no warnings" "! grep -q 'smazka: warning:' '$BUILD/t/min_golf.log'"
+
+"$BUILD/smazka-golf" -c examples/triangle_v1.2.smazka "$BUILD/t/min_triangle.sg"
+check "triangle minifies (-c)" "[ -s '$BUILD/t/min_triangle.sg' ]"
+"$BUILD/smazka-raster" "$BUILD/t/min_triangle.sg" 256 256 >"$BUILD/t/min_triangle.log" 2>&1
+check "minified triangle renders cleanly" "[ $? -eq 0 ]"
+check "minified triangle no warnings" "! grep -q 'smazka: warning:' '$BUILD/t/min_triangle.log'"
+
+cat > "$BUILD/t/compact_shapes.smazka" <<'EOF'
+P 0 0 100 0 100 100 0 100 white sw=3
+R 10 10 50 50 red sw=2
+C 100 100 30 blue sw=1.5
+path p1 closed 10,20 30,40 +10,+10 w=2 color=black
+fobj f1 fill=yellow sw=1 10,10 50,10 50,50 10,50
+EOF
+"$BUILD/smazka-raster" "$BUILD/t/compact_shapes.smazka" 256 256 >"$BUILD/t/compact_shapes.log" 2>&1
+check "compact shorthand constructs render" "[ $? -eq 0 ]"
+check "compact shorthand no warnings" "! grep -q 'smazka: warning:' '$BUILD/t/compact_shapes.log'"
+
 echo "== PNG output =="
 "$BUILD/smazka-raster" examples/triangle_v1.2.smazka 256 256 >/dev/null 2>&1
 python3 - "$ROOT" <<'EOF'
@@ -162,18 +186,14 @@ from PIL import Image
 import numpy as np
 im = np.asarray(Image.open(sys.argv[1] + '/diff.bmp').convert('RGB')).astype(int)
 row = im[128].astype(float)
-# find the transition (red/blue boundary); sides are relative to travel direction
 rb = row[:,0] - row[:,2]
 line = int(np.argmax(np.abs(np.diff(rb))))
-# near the curve (3-5 px): left side blue-dominant, right side red-dominant
 left = row[line-5:line-3]; right = row[line+3:line+5]
 assert left[:,0].mean() < 80 and left[:,2].mean() > 200, f"left side not blue {left.mean(axis=0)}"
 assert right[:,0].mean() > 200 and right[:,2].mean() < 80, f"right side not red {right.mean(axis=0)}"
-# smoothness away from the 6px line: no jumps > 12
 mask = np.ones(len(row), bool); mask[max(line-6,0):line+6] = False
 mx = np.abs(np.diff(row, axis=0)).max(axis=1)[mask[:-1]].max()
 assert mx < 12, f"diffusion not smooth (max jump {mx})"
-# far from the curve the field returns toward the white background
 far = row[max(line-30,0):max(line-25,0)]
 assert far.mean() > 190, f"diffusion did not fall off to background {far.mean()}"
 print("  PASS: diffusion boundary colors + smooth harmonic gradient + falloff")
@@ -423,7 +443,6 @@ probe('numeric-mix orange stroke FF8800', r > 200 and 90 <= g <= 170)
 probe('paper stays white at (10,10)', px(a, 10, 10).sum() > 740)
 sys.exit(0 if ok else 1)
 EOF
-rc=$?
 check "dialect pixel semantics + bin normalization" "[ $rc -eq 0 ]"
 
 echo

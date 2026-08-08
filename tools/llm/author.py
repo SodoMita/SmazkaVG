@@ -213,6 +213,54 @@ class Doc:
                 fh.write(out)
         return out
 
+    # ------------------------------------------------------------- emit compact .sg
+    def emit_compact(self, path=None):
+        """Emit ultra-compact shorthand format (.sg) for maximum text density.
+        Shapes use compact P, p, f single-letter primitives with short hex/palette
+        colors and clean numbers."""
+        L = []
+        for o in self.objects:
+            for li, (dots, w, sm, filled) in enumerate(o.loops):
+                sm = o.smooth if sm is None else sm
+                w = o.stroke_w if w is None else w
+                f_col = self._compact_col(o.fill or 'FFFFFF')
+                w_val = f"{w:.4f}".rstrip('0').rstrip('.')
+                w_str = f" sw={w_val}" if w > 0 else ""
+                pts_str = " ".join(f"{x:.4f}".rstrip('0').rstrip('.') + " " + f"{y:.4f}".rstrip('0').rstrip('.') for x, y in dots)
+                if filled:
+                    L.append(f"P {pts_str} {f_col}{w_str}")
+                else:
+                    L.append(f"p {pts_str}{w_str}")
+            for name in o.inner:
+                s = self.strokes.get(name)
+                if s is None or name in self.retired:
+                    continue
+                em = geometry.trim_ends(s.dots, s.trim) if s.trim else s.dots
+                pts_str = " ".join(f"{x:.4f}".rstrip('0').rstrip('.') + " " + f"{y:.4f}".rstrip('0').rstrip('.') for x, y in em)
+                col_str = self._compact_col(s.color)
+                s_w_val = f"{s.w:.4f}".rstrip('0').rstrip('.')
+                if s.white:
+                    L.append(f"P {pts_str} white sw={s_w_val}")
+                else:
+                    cl_str = " closed" if s.closed else ""
+                    L.append(f"p {pts_str} w={s_w_val}{cl_str} color={col_str}")
+        out = '\n'.join(L) + '\n'
+        if path:
+            with open(path, 'w') as fh:
+                fh.write(out)
+        return out
+
+    @staticmethod
+    def _compact_col(c):
+        pal = {'000000': 'black', '000000FF': 'black', 'FFFFFF': 'white', 'FFFFFFFF': 'white',
+               'FF0000': 'red', 'FF0000FF': 'red', '00FF00': 'green', '00FF00FF': 'green',
+               '0000FF': 'blue', '0000FFFF': 'blue', 'FFE0D0': 'skin', 'FFE0D0FF': 'skin'}
+        if c in pal:
+            return pal[c]
+        if len(c) in (6, 8) and c[0] == c[1] and c[2] == c[3] and c[4] == c[5]:
+            return f"#{c[0]}{c[2]}{c[4]}"
+        return f"#{c}"
+
     # ------------------------------------------------------------- emit preview svg
     @staticmethod
     def _pts(pts, prec=1):

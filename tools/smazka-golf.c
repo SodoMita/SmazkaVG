@@ -1,38 +1,29 @@
 /*
- * SmazkaVG code-golf dialect compiler (tools/smazka-golf)
- * ========================================================
+ * SmazkaVG code-golf dialect compiler & minifier (tools/smazka-golf)
+ * =================================================================
  *
- * Compiles a byte-starved shorthand (.sg) into canonical Line-ASM (v1.3).
- * Every .sg construct expands 1:1; the output renders with the standard
- * rasterizer.
+ * 1. Compiles a byte-starved shorthand (.sg) into canonical Line-ASM.
+ * 2. Minifies/compresses any Line-ASM or xauthor document into ultra-compact
+ *    text representation (-c / --compact).
  *
- *   cc -O2 -o smazka-golf tools/smazka-golf.c
- *   ./smazka-golf face.sg > face.smazka
- *   ./smazka-raster face.smazka
+ * Usage:
+ *   smazka-golf face.sg face.smazka         # compile shorthand to Line-ASM
+ *   smazka-golf -c face.smazka face.sg      # minify Line-ASM to compact .sg
  *
  * Dialect summary
  * ---------------
  *   ! comment (also #)
- *   v 10 20              vertex, auto-ID
- *   + 5 0                vertex relative to the previous one, auto-ID
- *   P x1 y1 x2 y2 ...    polygon: vertices + edges + closed face, auto-ID
- *   R x y w h            rectangle, auto-ID
- *   C cx cy r            circle (4 anchor vertices + 4 cubic Beziers), auto-ID
- *   E va vb [cp...]      edge between existing vertex ids, auto-ID
- *                        (type inferred: 0 cp=seg, 2 cp=quad, 4 cp=cubic)
- *   S eid color w0..     stroke on edge (color: name, #rgb, rrggbb, rrggbbaa)
+ *   v x y                vertex (auto-ID)
+ *   + dx dy              vertex relative to previous
+ *   P x1 y1 x2 y2 ...    polygon: vertices + edges + closed face (auto-ID)
+ *   R x y w h            rectangle (auto-ID)
+ *   C cx cy r            circle (4 anchor vertices + 4 cubic Beziers)
+ *   E va vb [cp...]      edge between vertex ids
+ *   S eid color w0...    stroke on edge
  *   F eid... [color]     face (optional inline fill)
- *   M x vid...           mirror copies of vertices across the x axis (auto-ID)
- *   M y vid...           mirror copies across the y axis
- *   D dx dy vid...       translated copies (auto-ID)
- *
- * Palette: red green blue black white yellow cyan magenta orange pink
- *          purple brown gray silver maroon lime navy teal gold skin
- *
- * This addresses the golfability audit: ~45% of a naive file is manual
- * global-ID bookkeeping; here IDs are implicit; shapes are one token;
- * colors are 1-4 bytes; symmetry needs one command instead of duplicated
- * geometry.
+ *   M x|y vid...         mirror copies of vertices across axis
+ *   D dx dy vid...       translated copies
+ *   K node t tx ty rot   keyframe
  */
 
 #include <stdio.h>
@@ -42,7 +33,12 @@
 #include <math.h>
 #include <strings.h>
 
-#define MAX_PTS 4096
+#include "../src/xauthor.h"
+
+#define MAX_PTS 32768
+#define MAX_EDGES 32768
+#define MAX_FACES 1024
+#define MAX_STROKES 32768
 
 static FILE *g_out;
 static int nv, ne, nf, ns, nkf;
@@ -63,44 +59,336 @@ static int addv(double x, double y) {
 }
 
 static unsigned parse_color(const char *s) {
-    static const struct { const char *n; unsigned c; } pal[] = {
-        { "black", 0x000000FF }, { "white", 0xFFFFFFFF }, { "red", 0xFF0000FF },
-        { "green", 0x00FF00FF }, { "blue", 0x0000FFFF }, { "yellow", 0xFFFF00FF },
-        { "cyan", 0x00FFFFFF }, { "magenta", 0xFF00FFFF }, { "orange", 0xFFA500FF },
-        { "pink", 0xFFC0CBFF }, { "purple", 0x800080FF }, { "brown", 0xA52A2AFF },
-        { "gray", 0x808080FF }, { "grey", 0x808080FF }, { "silver", 0xC0C0C0FF },
-        { "maroon", 0x800000FF }, { "lime", 0x00FF00FF }, { "navy", 0x000080FF },
-        { "teal", 0x008080FF }, { "gold", 0xFFD700FF }, { "skin", 0xFFE0D0FF },
-        { NULL, 0 }
+    char norm[64];
+    xa_norm_color(s, norm, sizeof(norm));
+    unsigned val = 0xFFFFFFFF;
+    if (sscanf(norm, "%x", &val) == 1) {
+        if (strlen(norm) == 6) val = (val << 8) | 0xFF;
+    }
+    return val;
+}
+
+static void format_color(const char *s, char *out, size_t cap) {
+    static const struct { const char *n; const char *c; } pal[] = {
+        { "black", "000000FF" }, { "white", "FFFFFF" }, { "white", "FFFFFFFF" },
+        { "red", "FF0000FF" }, { "green", "00FF00FF" }, { "blue", "0000FFFF" },
+        { "yellow", "FFFF00FF" }, { "cyan", "00FFFFFF" }, { "magenta", "FF00FFFF" },
+        { "orange", "FFA500FF" }, { "pink", "FFC0CBFF" }, { "purple", "800080FF" },
+        { "brown", "A52A2AFF" }, { "gray", "808080FF" }, { "silver", "C0C0C0FF" },
+        { "skin", "FFE0D0FF" }, { NULL, NULL }
     };
-    const char *p = s;
-    if (*p == '#') p++;
-    if (strchr(p, ':')) p = strchr(p, ':') + 1;      /* allow "color:name" */
-    if (strchr(p, '=')) p = strchr(p, '=') + 1;      /* allow "color=name" */
-    for (int i = 0; pal[i].n; i++)
-        if (strcasecmp(p, pal[i].n) == 0) return pal[i].c;
-    unsigned v = 0;
-    if (sscanf(p, "%x", &v) != 1) { fprintf(stderr, "golf: bad color '%s'\n", s); v = 0xFF0000FF; }
-    switch (strlen(p)) {
-    case 3: return ((((v >> 8) & 0xF) * 0x11) << 24) | ((((v >> 4) & 0xF) * 0x11) << 16)
-                  | (((v & 0xF) * 0x11) << 8) | 0xFF;
-    case 6: return (v << 8) | 0xFF;
-    default: return v;
+    char norm[64];
+    xa_norm_color(s, norm, sizeof(norm));
+    for (int i = 0; pal[i].n; i++) {
+        if (strcasecmp(norm, pal[i].c) == 0 ||
+            (strlen(norm) == 6 && strncasecmp(pal[i].c, norm, 6) == 0)) {
+            snprintf(out, cap, "%s", pal[i].n);
+            return;
+        }
+    }
+    if (strlen(norm) == 6 || (strlen(norm) == 8 && strcasecmp(norm + 6, "FF") == 0)) {
+        if (norm[0] == norm[1] && norm[2] == norm[3] && norm[4] == norm[5]) {
+            snprintf(out, cap, "#%c%c%c", norm[0], norm[2], norm[4]);
+            return;
+        }
+        snprintf(out, cap, "#%.6s", norm);
+        return;
+    }
+    snprintf(out, cap, "#%s", norm);
+}
+
+static void fmt_num(double v, char *out, size_t cap) {
+    if (fabs(v - round(v)) < 1e-5) {
+        snprintf(out, cap, "%.0f", v);
+    } else {
+        snprintf(out, cap, "%.4f", v);
+        char *p = out + strlen(out) - 1;
+        while (p > out && *p == '0') { *p = 0; p--; }
+        if (p > out && *p == '.') *p = 0;
     }
 }
 
-static int is_hex_color(const char *t) {
-    size_t L = strlen(t);
-    if (L != 3 && L != 6 && L != 8) return 0;
-    for (size_t i = 0; i < L; i++)
-        if (!((t[i] >= '0' && t[i] <= '9') || (t[i] >= 'a' && t[i] <= 'f') || (t[i] >= 'A' && t[i] <= 'F')))
-            return 0;
-    return 1;
+/* ---------------- minifier (-c mode) ---------------- */
+typedef struct { double x, y; } Pt;
+typedef struct { int v0, v1; char type[16]; double cps[8]; int nc; } EdgeData;
+typedef struct { int eids[64]; int ne; char fill[64]; } FaceData;
+typedef struct { int eid; char col[64]; double w[16]; int nw; char cap[16]; } StrokeData;
+
+static int minify(const char *in_path, const char *out_path) {
+    int nerr = 0;
+    char *expanded = xa_read_expand(in_path, stderr, &nerr);
+    if (!expanded) { fprintf(stderr, "golf: cannot read %s\n", in_path); return 1; }
+
+    FILE *out = stdout;
+    if (out_path && strcmp(out_path, "-") != 0) {
+        out = fopen(out_path, "w");
+        if (!out) {
+            fprintf(stderr, "golf: cannot write %s\n", out_path);
+            free(expanded);
+            return 1;
+        }
+    }
+
+    Pt *verts = calloc(MAX_PTS, sizeof(Pt));
+    EdgeData *edges = calloc(MAX_EDGES, sizeof(EdgeData));
+    FaceData *faces = calloc(MAX_FACES, sizeof(FaceData));
+    StrokeData *strokes = calloc(MAX_STROKES, sizeof(StrokeData));
+    if (!verts || !edges || !faces || !strokes) {
+        fprintf(stderr, "golf: out of memory\n");
+        free(expanded);
+        if (verts) free(verts);
+        if (edges) free(edges);
+        if (faces) free(faces);
+        if (strokes) free(strokes);
+        return 1;
+    }
+
+    int num_v = 0, num_e = 0, num_f = 0, num_s = 0;
+
+    char *cur = expanded;
+    char line[1024];
+    while (xa_line(&cur, line, sizeof(line))) {
+        char *copy = strdup(line);
+        char *tv[128];
+        int nt = xa_tok(copy, tv, 128);
+        if (nt == 0) { free(copy); continue; }
+
+        char cmd = tv[0][0];
+        if (cmd == 'v' && nt >= 4) {
+            int id = atoi(tv[1]);
+            if (id >= 0 && id < MAX_PTS) {
+                verts[id].x = atof(tv[2]);
+                verts[id].y = atof(tv[3]);
+                if (id >= num_v) num_v = id + 1;
+            }
+        } else if (cmd == 'e' && nt >= 4) {
+            int id = atoi(tv[1]);
+            if (id >= 0 && id < MAX_EDGES) {
+                edges[id].v0 = atoi(tv[2]);
+                edges[id].v1 = atoi(tv[3]);
+                snprintf(edges[id].type, sizeof(edges[id].type), "seg");
+                edges[id].nc = 0;
+                for (int i = 4; i < nt; i++) {
+                    if (strncmp(tv[i], "type=", 5) == 0) {
+                        snprintf(edges[id].type, sizeof(edges[id].type), "%s", tv[i] + 5);
+                    } else if (xa_is_float(tv[i]) && edges[id].nc < 8) {
+                        edges[id].cps[edges[id].nc++] = atof(tv[i]);
+                    }
+                }
+                if (id >= num_e) num_e = id + 1;
+            }
+        } else if (cmd == 'f' && nt >= 2) {
+            int id = atoi(tv[1]);
+            if (id >= 0 && id < MAX_FACES) {
+                faces[id].ne = 0;
+                snprintf(faces[id].fill, sizeof(faces[id].fill), "FFFFFF");
+                for (int i = 2; i < nt; i++) {
+                    if (xa_is_num(tv[i])) {
+                        if (faces[id].ne < 64) faces[id].eids[faces[id].ne++] = atoi(tv[i]);
+                    } else {
+                        snprintf(faces[id].fill, sizeof(faces[id].fill), "%s", tv[i]);
+                    }
+                }
+                if (id >= num_f) num_f = id + 1;
+            }
+        } else if (cmd == 's' && nt >= 3) {
+            int id = atoi(tv[1]);
+            if (id >= 0 && id < MAX_STROKES) {
+                strokes[id].eid = atoi(tv[2]);
+                snprintf(strokes[id].col, sizeof(strokes[id].col), "%s", nt >= 4 ? tv[3] : "000000FF");
+                snprintf(strokes[id].cap, sizeof(strokes[id].cap), "round");
+                strokes[id].nw = 0;
+                for (int i = 4; i < nt; i++) {
+                    if (strncmp(tv[i], "cap=", 4) == 0) {
+                        snprintf(strokes[id].cap, sizeof(strokes[id].cap), "%s", tv[i] + 4);
+                    } else if (xa_is_float(tv[i]) && strokes[id].nw < 16) {
+                        strokes[id].w[strokes[id].nw++] = atof(tv[i]);
+                    }
+                }
+                if (id >= num_s) num_s = id + 1;
+            }
+        } else {
+            fprintf(out, "%s\n", line);
+        }
+        free(copy);
+    }
+
+    /* Track which edges have strokes */
+    int stroke_for_e[MAX_EDGES];
+    memset(stroke_for_e, -1, sizeof(stroke_for_e));
+    for (int i = 0; i < num_s; i++) {
+        if (strokes[i].eid >= 0 && strokes[i].eid < MAX_EDGES) {
+            stroke_for_e[strokes[i].eid] = i;
+        }
+    }
+
+    unsigned char claimed_v[MAX_PTS] = {0};
+    unsigned char claimed_e[MAX_EDGES] = {0};
+
+    /* Shape detection on faces */
+    for (int i = 0; i < num_f; i++) {
+        FaceData *fd = &faces[i];
+        if (fd->ne == 0) continue;
+        char col_str[64];
+        format_color(fd->fill, col_str, sizeof(col_str));
+
+        /* Check stroke width & color on face edges */
+        double face_sw = -1;
+        int uniform_strokes = (fd->ne > 0);
+        char face_scol[64] = "";
+        for (int k = 0; k < fd->ne; k++) {
+            int sid = stroke_for_e[fd->eids[k]];
+            if (sid < 0) { uniform_strokes = 0; break; }
+            double w = (strokes[sid].nw > 0) ? strokes[sid].w[0] : 0;
+            if (face_sw < 0) {
+                face_sw = w;
+                snprintf(face_scol, sizeof(face_scol), "%s", strokes[sid].col);
+            } else if (fabs(face_sw - w) > 1e-4 || strcasecmp(face_scol, strokes[sid].col) != 0) {
+                uniform_strokes = 0; break;
+            }
+        }
+
+        /* Check for Rectangle: 4 straight edges forming axis-aligned rect */
+        if (fd->ne == 4) {
+            int e0 = fd->eids[0], e1 = fd->eids[1], e2 = fd->eids[2], e3 = fd->eids[3];
+            if (edges[e0].nc == 0 && edges[e1].nc == 0 && edges[e2].nc == 0 && edges[e3].nc == 0) {
+                int v0 = edges[e0].v0, v1 = edges[e0].v1, v2 = edges[e1].v1, v3 = edges[e2].v1;
+                double x0 = verts[v0].x, y0 = verts[v0].y;
+                double x1 = verts[v1].x, y1 = verts[v1].y;
+                double x2 = verts[v2].x, y2 = verts[v2].y;
+                double x3 = verts[v3].x, y3 = verts[v3].y;
+                if (fabs(y0 - y1) < 1e-4 && fabs(x1 - x2) < 1e-4 && fabs(y2 - y3) < 1e-4 && fabs(x3 - x0) < 1e-4) {
+                    char sx0[32], sy0[32], sw[32], sh[32];
+                    fmt_num(x0, sx0, sizeof(sx0)); fmt_num(y0, sy0, sizeof(sy0));
+                    fmt_num(x1 - x0, sw, sizeof(sw)); fmt_num(y2 - y1, sh, sizeof(sh));
+                    fprintf(out, "R %s %s %s %s %s", sx0, sy0, sw, sh, col_str);
+                    if (uniform_strokes && face_sw > 0) {
+                        char ssw[32]; fmt_num(face_sw, ssw, sizeof(ssw));
+                        fprintf(out, " sw=%s", ssw);
+                        for (int k = 0; k < 4; k++) claimed_e[fd->eids[k]] = 1;
+                    }
+                    fprintf(out, "\n");
+                    claimed_v[v0] = claimed_v[v1] = claimed_v[v2] = claimed_v[v3] = 1;
+                    continue;
+                }
+            }
+        }
+
+        /* Check for Circle: 4 cubic Bezier edges forming a circle */
+        if (fd->ne == 4) {
+            int e0 = fd->eids[0], e1 = fd->eids[1], e2 = fd->eids[2], e3 = fd->eids[3];
+            if (edges[e0].nc == 4 && edges[e1].nc == 4 && edges[e2].nc == 4 && edges[e3].nc == 4) {
+                int v0 = edges[e0].v0, v1 = edges[e0].v1, v2 = edges[e1].v1, v3 = edges[e2].v1;
+                double x0 = verts[v0].x, y0 = verts[v0].y;
+                double x1 = verts[v1].x, y1 = verts[v1].y;
+                double x2 = verts[v2].x, y2 = verts[v2].y;
+                double cx = (x0 + x2) / 2.0;
+                double cy = (y0 + y2) / 2.0;
+                double r0 = hypot(x0 - cx, y0 - cy);
+                double r1 = hypot(x1 - cx, y1 - cy);
+                if (fabs(r0 - r1) < 1e-2 && r0 > 0.5) {
+                    char scx[32], scy[32], sr[32];
+                    fmt_num(cx, scx, sizeof(scx));
+                    fmt_num(cy, scy, sizeof(scy));
+                    fmt_num(r0, sr, sizeof(sr));
+                    fprintf(out, "C %s %s %s %s", scx, scy, sr, col_str);
+                    if (uniform_strokes && face_sw > 0) {
+                        char ssw[32]; fmt_num(face_sw, ssw, sizeof(ssw));
+                        fprintf(out, " sw=%s", ssw);
+                        for (int k = 0; k < 4; k++) claimed_e[fd->eids[k]] = 1;
+                    }
+                    fprintf(out, "\n");
+                    claimed_v[v0] = claimed_v[v1] = claimed_v[v2] = claimed_v[v3] = 1;
+                    continue;
+                }
+            }
+        }
+
+        /* Polygon: arbitrary closed loop */
+        int straight = 1;
+        for (int k = 0; k < fd->ne; k++) if (edges[fd->eids[k]].nc != 0) { straight = 0; break; }
+        if (straight && fd->ne >= 3) {
+            fprintf(out, "P");
+            for (int k = 0; k < fd->ne; k++) {
+                int eid = fd->eids[k];
+                int vid = edges[eid].v0;
+                char sx[32], sy[32];
+                fmt_num(verts[vid].x, sx, sizeof(sx));
+                fmt_num(verts[vid].y, sy, sizeof(sy));
+                fprintf(out, " %s %s", sx, sy);
+                claimed_v[vid] = 1;
+            }
+            fprintf(out, " %s", col_str);
+            if (uniform_strokes && face_sw > 0) {
+                char ssw[32]; fmt_num(face_sw, ssw, sizeof(ssw));
+                fprintf(out, " sw=%s", ssw);
+                for (int k = 0; k < fd->ne; k++) claimed_e[fd->eids[k]] = 1;
+            }
+            fprintf(out, "\n");
+            continue;
+        }
+
+        /* Fallback: F line */
+        fprintf(out, "F");
+        for (int k = 0; k < fd->ne; k++) fprintf(out, " %d", fd->eids[k]);
+        fprintf(out, " %s\n", col_str);
+    }
+
+    /* Unclaimed standalone vertices */
+    for (int i = 0; i < num_v; i++) {
+        if (!claimed_v[i]) {
+            char sx[32], sy[32];
+            fmt_num(verts[i].x, sx, sizeof(sx));
+            fmt_num(verts[i].y, sy, sizeof(sy));
+            fprintf(out, "v %s %s\n", sx, sy);
+        }
+    }
+
+    /* Unclaimed standalone edges */
+    for (int i = 0; i < num_e; i++) {
+        if (!claimed_e[i]) {
+            EdgeData *ed = &edges[i];
+            fprintf(out, "E %d %d", ed->v0, ed->v1);
+            for (int k = 0; k < ed->nc; k++) {
+                char scp[32]; fmt_num(ed->cps[k], scp, sizeof(scp));
+                fprintf(out, " %s", scp);
+            }
+            fprintf(out, "\n");
+        }
+    }
+
+    /* Strokes on unclaimed edges */
+    for (int i = 0; i < num_s; i++) {
+        StrokeData *sd = &strokes[i];
+        if (sd->eid >= 0 && sd->eid < MAX_EDGES && claimed_e[sd->eid]) continue;
+        char col_str[64];
+        format_color(sd->col, col_str, sizeof(col_str));
+        fprintf(out, "S %d %s", sd->eid, col_str);
+        for (int k = 0; k < sd->nw; k++) {
+            char sw[32]; fmt_num(sd->w[k], sw, sizeof(sw));
+            fprintf(out, " %s", sw);
+        }
+        if (strcmp(sd->cap, "round") != 0) fprintf(out, " cap=%s", sd->cap);
+        fprintf(out, "\n");
+    }
+
+    free(expanded);
+    free(verts); free(edges); free(faces); free(strokes);
+    if (out != stdout) fclose(out);
+    return 0;
 }
 
 int main(int argc, char **argv) {
+    if (argc >= 2 && (strcmp(argv[1], "-c") == 0 || strcmp(argv[1], "--compact") == 0)) {
+        if (argc < 3) {
+            fprintf(stderr, "Usage: %s -c <in.smazka> [out.sg]\n", argv[0]);
+            return 1;
+        }
+        return minify(argv[2], argc >= 4 ? argv[3] : "-");
+    }
+
     if (argc < 2) {
-        fprintf(stderr, "SmazkaVG golf dialect compiler\nUsage: %s <in.sg> [out.smazka]\n", argv[0]);
+        fprintf(stderr, "SmazkaVG golf dialect compiler & minifier\nUsage:\n  %s <in.sg> [out.smazka]\n  %s -c <in.smazka> [out.sg]\n", argv[0], argv[0]);
         return 1;
     }
     FILE *f = fopen(argv[1], "r");
@@ -119,7 +407,7 @@ int main(int argc, char **argv) {
         char cmd = *p++;
         while (*p == ' ' || *p == '\t') p++;
         char *nl = strchr(p, '\n'); if (nl) *nl = 0;
-        for (char *q = p; *q; q++) if (*q == '!') { *q = 0; break; }   /* '!' is the only comment marker; '#' is a color prefix */
+        for (char *q = p; *q; q++) if (*q == '!') { *q = 0; break; }
 
         if (cmd == 'v') {
             double x, y;
@@ -148,18 +436,16 @@ int main(int argc, char **argv) {
                 if (n < 3) { fprintf(stderr, "golf: C needs cx cy r\n"); continue; }
                 double cx = vals[0], cy = vals[1], r = vals[2];
                 const double k = 0.5522847498307936;
-                /* 4 anchors at 0/90/180/270 degrees */
                 int a[4];
                 a[0] = addv(cx + r, cy);
                 a[1] = addv(cx, cy + r);
                 a[2] = addv(cx - r, cy);
                 a[3] = addv(cx, cy - r);
-                /* one cubic per quadrant, 2 control points each */
                 double cps[4][4] = {
-                    { cx + r, cy + k * r, cx + k * r, cy + r },   /* a0 -> a1 */
-                    { cx - k * r, cy + r, cx - r, cy + k * r },   /* a1 -> a2 */
-                    { cx - r, cy - k * r, cx - k * r, cy - r },   /* a2 -> a3 */
-                    { cx + k * r, cy - r, cx + r, cy - k * r }    /* a3 -> a0 */
+                    { cx + r, cy + k * r, cx + k * r, cy + r },
+                    { cx - k * r, cy + r, cx - r, cy + k * r },
+                    { cx - r, cy - k * r, cx - k * r, cy - r },
+                    { cx + k * r, cy - r, cx + r, cy - k * r }
                 };
                 int fe[4];
                 for (int i = 0; i < 4; i++) {
@@ -169,13 +455,12 @@ int main(int argc, char **argv) {
                     fe[i] = eid;
                 }
                 emit("f %d %d %d %d %d\n", nf++, fe[0], fe[1], fe[2], fe[3]);
-                continue;   /* already emitted edges + face */
-            } else { /* P */
+                continue;
+            } else {
                 if (n < 6 || n % 2 != 0) { fprintf(stderr, "golf: P needs x1 y1 x2 y2 ...\n"); continue; }
                 int m = n / 2;
                 for (int i = 0; i < m; i++) addv(vals[2 * i], vals[2 * i + 1]);
             }
-            /* shared polygon close: edges + face */
             int cnt = nv - first;
             if (cnt < 3) continue;
             int fe[64];
@@ -230,7 +515,6 @@ int main(int argc, char **argv) {
                 } else break;
             }
             if (n < 3) { fprintf(stderr, "golf: F needs >=3 edge ids\n"); continue; }
-            /* optional trailing fill color */
             char col[64] = "";
             char *t2 = p;
             int nt = 0;
@@ -239,7 +523,7 @@ int main(int argc, char **argv) {
                 if (!*t2) break;
                 char tok[64];
                 if (sscanf(t2, "%63s", tok) == 1) {
-                    if (nt >= n && is_hex_color(tok)) strncpy(col, tok, 63);
+                    if (nt >= n && (xa_is_hexcol(tok) || *tok == '#')) snprintf(col, sizeof(col), "%s", tok);
                     nt++;
                     while (*t2 && *t2 != ' ' && *t2 != '\t') t2++;
                 } else break;
@@ -281,7 +565,7 @@ int main(int argc, char **argv) {
                     t += nread;
                 } else break;
             }
-        } else if (cmd == 'K') {   /* keyframe: K <node> <time> <tx> <ty> <rot> [sx] [sy] [skew] */
+        } else if (cmd == 'K') {
             int node; double t, vals[6] = {0,0,0,1,1,0};
             char *tkn = p;
             int got = 0;

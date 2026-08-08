@@ -94,6 +94,10 @@ check('smazka: no vertex is shared between chains',
       len(set(ln.split()[1] for ln in smz.splitlines() if ln.startswith('v ')))
       == len([ln for ln in smz.splitlines() if ln.startswith('v ')]))
 
+cmp_sg = doc.emit_compact()
+check('emit_compact emits shorthand polygon lines', 'P ' in cmp_sg)
+check('emit_compact uses short palette names/hex', 'white' in cmp_sg or '#fff' in cmp_sg)
+
 # seam exactness: the two loops carry identical seam coordinates
 doc2 = author.Doc(100, 100)
 doc2.st('wrist', [(40, 80), (60, 80)], w=2.0)
@@ -119,6 +123,12 @@ if os.path.exists(bin_path):
         check('clean render: no red vertex markers by default',
               not any(px[x, y][0] > 200 and px[x, y][1] < 90
                       for x in range(0, 120, 3) for y in range(0, 86, 3)))
+
+    with open('build/t/selftest_compact.sg', 'w') as fh:
+        fh.write(cmp_sg)
+    rc_compact = os.system(f'{bin_path} build/t/selftest_compact.sg 120 86 '
+                           f'>build/t/selftest_compact_raster.log 2>&1')
+    check('emitted compact .sg renders with the C rasterizer', rc_compact == 0)
 else:
     print('  SKIP: rasterizer binary not found (run make first)')
 
